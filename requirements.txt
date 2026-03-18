@@ -10,6 +10,9 @@ torchlibrosa
 torchcontrib
 torchmetrics
 
+# setuptools <81 needed for pkg_resources (required by pytorch_lightning 1.x)
+setuptools<81
+
 # Audio processing
 librosa>=0.11.0
 soundfile>=0.13.0
