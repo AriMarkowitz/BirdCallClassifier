@@ -1,0 +1,3 @@
+[submodule "external/htsat"]
+	path = external/htsat
+	url = https://github.com/RetroCirce/HTS-Audio-Transformer.git
