@@ -12,7 +12,7 @@
 
 # ── Project paths ──
 PROJECT_DIR="$HOME/BirdCallClassifier"
-ENV_NAME="birdclef"
+ENV_NAME="birdcallclassifier"
 
 # ── Create log directory ──
 mkdir -p "$PROJECT_DIR/logs"
@@ -22,29 +22,20 @@ module purge
 module load cuda/12.8.0-dh6b
 module load miniconda3/latest
 
+# ── Activate conda ──
+eval "$(conda shell.bash hook)"
+
 # ── Create conda env if it doesn't exist ──
 if ! conda env list | grep -q "$ENV_NAME"; then
     echo "Creating conda environment: $ENV_NAME"
     conda create -n "$ENV_NAME" python=3.10 -y
     conda activate "$ENV_NAME"
 
-    # PyTorch with CUDA 12
+    # PyTorch with CUDA 12.1
     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-    # HTSAT dependencies
-    pip install \
-        pytorch_lightning==1.5.9 \
-        torchlibrosa==0.0.9 \
-        torchcontrib==0.0.2 \
-        librosa \
-        soundfile \
-        h5py \
-        pandas \
-        scikit-learn \
-        tensorboard \
-        scipy \
-        tqdm \
-        museval
+    # Remaining dependencies
+    pip install -r "$PROJECT_DIR/requirements.txt"
 else
     conda activate "$ENV_NAME"
 fi
