@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.join(PROJ_ROOT, "src"))
 import config as htsat_config
 from model.htsat import HTSAT_Swin_Transformer
 from sed_model import SEDWrapper
+from torch.utils.data import WeightedRandomSampler
 from dataset import get_dataloaders, build_label_map
 
 logging.basicConfig(level=logging.INFO)
@@ -57,7 +58,7 @@ def load_pretrained_htsat(checkpoint_path, config, num_classes):
     )
 
     if checkpoint_path and os.path.isfile(checkpoint_path):
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         if "state_dict" in ckpt:
             state_dict = ckpt["state_dict"]
             state_dict = {
@@ -107,8 +108,8 @@ class BirdCLEFWrapper(pl.LightningModule):
     Lightning wrapper for HTSAT fine-tuning on BirdCLEF.
     """
 
-    def __init__(self, sed_model, config, num_classes, learning_rate=3e-5,
-                 warmup_epochs=1, max_epochs=30):
+    def __init__(self, sed_model, config, num_classes, learning_rate=1e-4,
+                 warmup_epochs=1, max_epochs=30, n_train_audio=0):
         super().__init__()
         self.sed_model = sed_model
         self.config = config
@@ -116,6 +117,7 @@ class BirdCLEFWrapper(pl.LightningModule):
         self.learning_rate = learning_rate
         self.warmup_epochs = warmup_epochs
         self.max_epochs = max_epochs
+        self.n_train_audio = n_train_audio
         self.loss_fn = nn.BCELoss()
 
     def forward(self, x, mix_lambda=None):
@@ -142,14 +144,24 @@ class BirdCLEFWrapper(pl.LightningModule):
         pred, _ = self(batch["waveform"])
         loss = self._safe_loss(pred, batch["target"])
         self.log("val_loss", loss, on_epoch=True, prog_bar=True)
-        return {"pred": pred.detach(), "target": batch["target"].detach()}
+        # Accumulate for epoch-end AUC computation
+        if not hasattr(self, "_val_preds"):
+            self._val_preds = []
+            self._val_targets = []
+        self._val_preds.append(pred.detach().cpu())
+        self._val_targets.append(batch["target"].detach().cpu())
 
-    def validation_epoch_end(self, outputs):
+    def on_validation_epoch_end(self):
         import numpy as np
         from sklearn.metrics import roc_auc_score
 
-        preds = torch.cat([o["pred"] for o in outputs]).cpu().numpy()
-        targets = torch.cat([o["target"] for o in outputs]).cpu().numpy()
+        if not hasattr(self, "_val_preds") or len(self._val_preds) == 0:
+            return
+
+        preds = torch.cat(self._val_preds).numpy()
+        targets = torch.cat(self._val_targets).numpy()
+        self._val_preds.clear()
+        self._val_targets.clear()
 
         try:
             col_mask = targets.sum(axis=0) > 0
@@ -176,6 +188,43 @@ class BirdCLEFWrapper(pl.LightningModule):
 
         return optimizer
 
+    def on_train_epoch_start(self):
+        """Curriculum: gradually increase soundscape weight over training."""
+        # Unwrap PL's dataloader wrappers to find the WeightedRandomSampler
+        sampler = None
+        dl = self.trainer.train_dataloader
+        # PL 1.9 wraps in CombinedLoader; dig through possible wrappers
+        for attr in ['loaders', 'flattened']:
+            if hasattr(dl, attr):
+                val = getattr(dl, attr)
+                if isinstance(val, (list, tuple)):
+                    dl = val[0]
+                elif isinstance(val, dict):
+                    dl = list(val.values())[0]
+                break
+        # Now dl should be a DataLoader or another wrapper
+        if hasattr(dl, 'sampler'):
+            s = dl.sampler
+            if isinstance(s, WeightedRandomSampler):
+                sampler = s
+
+        if sampler is None:
+            if self.current_epoch == 0:
+                logger.warning("Curriculum: could not find WeightedRandomSampler, skipping")
+            return
+
+        # Curriculum schedule: ramp soundscape weight from 0.5 to 5.0
+        progress = self.current_epoch / max(self.max_epochs - 1, 1)
+        weight = 0.5 + 4.5 * progress  # 0.5 at epoch 0, 5.0 at final epoch
+
+        n_total = len(sampler.weights)
+        new_weights = torch.ones(n_total, dtype=torch.float64)
+        new_weights[self.n_train_audio:] = weight
+        sampler.weights = new_weights
+
+        self.log("soundscape_weight", weight)
+        logger.info(f"Epoch {self.current_epoch}: curriculum soundscape_weight={weight:.2f}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Fine-tune HTSAT on BirdCLEF 2026")
@@ -186,18 +235,14 @@ def main():
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_epochs", type=int, default=50)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--warmup_epochs", type=int, default=1)
-    parser.add_argument("--gpus", type=int, default=1)
-    parser.add_argument("--val_frac", type=float, default=0.1)
+    parser.add_argument("--val_frac", type=float, default=0.15)
     parser.add_argument("--save_dir", type=str,
                         default=os.path.join(PROJ_ROOT, "checkpoints"))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume_from", type=str, default=None,
                         help="Path to Lightning checkpoint to resume training from")
-    # New args
-    parser.add_argument("--val_sites", type=str, nargs="+", default=["S22", "S23"],
-                        help="Site IDs to hold out for validation (e.g. S22 S23)")
     parser.add_argument("--soundscape_weight", type=float, default=3.0,
                         help="Upweight soundscape samples in training sampler")
     parser.add_argument("--use_wandb", action="store_true",
@@ -210,6 +255,9 @@ def main():
 
     pl.seed_everything(args.seed)
 
+    # Use tensor cores for fp32 matmuls (L40S has them)
+    torch.set_float32_matmul_precision("medium")
+
     # Patch config for our dataset
     htsat_config.classes_num = len(
         build_label_map(os.path.join(args.data_dir, "taxonomy.csv"))
@@ -218,7 +266,7 @@ def main():
     htsat_config.enable_tscam = True
 
     # Build dataloaders
-    train_loader, val_loader, label_map, num_classes = get_dataloaders(
+    train_loader, val_loader, label_map, num_classes, n_train_audio = get_dataloaders(
         args.data_dir,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -226,11 +274,19 @@ def main():
         clip_duration=htsat_config.clip_samples / htsat_config.sample_rate,
         val_frac=args.val_frac,
         seed=args.seed,
-        val_sites=args.val_sites,
         soundscape_weight=args.soundscape_weight,
     )
     logger.info(f"Classes: {num_classes}, Train batches: {len(train_loader)}, "
                 f"Val batches: {len(val_loader)}")
+
+    # Curriculum schedule summary
+    logger.info(f"Curriculum training: soundscape_weight ramps 0.50 -> 5.00 "
+                f"linearly over {args.max_epochs} epochs")
+    logger.info(f"  Epoch 0: weight=0.50 (mostly clean audio)")
+    mid = args.max_epochs // 2
+    mid_w = 0.5 + 4.5 * (mid / max(args.max_epochs - 1, 1))
+    logger.info(f"  Epoch {mid}: weight={mid_w:.2f}")
+    logger.info(f"  Epoch {args.max_epochs - 1}: weight=5.00 (heavy soundscape focus)")
 
     # Build model
     htsat_config.classes_num = num_classes
@@ -240,6 +296,7 @@ def main():
         learning_rate=args.lr,
         warmup_epochs=args.warmup_epochs,
         max_epochs=args.max_epochs,
+        n_train_audio=n_train_audio,
     )
 
     # Save each seed's checkpoints in a subdirectory
@@ -268,7 +325,7 @@ def main():
                 "batch_size": args.batch_size,
                 "max_epochs": args.max_epochs,
                 "seed": args.seed,
-                "val_sites": args.val_sites,
+                "val_frac": args.val_frac,
                 "soundscape_weight": args.soundscape_weight,
                 "warmup_epochs": args.warmup_epochs,
                 "model": "htsat-tiny",
@@ -278,7 +335,8 @@ def main():
 
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
-        gpus=args.gpus,
+        accelerator="gpu",
+        devices=1,
         callbacks=[ckpt_callback, lr_monitor],
         logger=loggers if loggers else True,
         default_root_dir=args.save_dir,

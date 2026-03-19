@@ -167,14 +167,16 @@ class SoundscapeDataset(Dataset):
         return {"waveform": audio, "target": target}
 
 
-def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.1,
-                 seed=42, val_sites=None):
+def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.15,
+                 seed=42):
     """
-    Build train/val datasets combining TrainAudioDataset + SoundscapeDataset.
+    Build train/val datasets.
 
-    If val_sites is provided (e.g. ["S22", "S23"]), soundscape segments from those
-    sites go to val and the rest to train. Train audio is always in train split.
-    Otherwise falls back to random split.
+    Train = all train_audio + (1-val_frac) of soundscape segments.
+    Val   = val_frac of soundscape segments (random split).
+
+    This ensures val reflects real test conditions (noisy multi-species audio)
+    while training sees all sites and all train_audio.
 
     Returns:
         train_dataset, val_dataset, label_map, num_classes, n_train_audio, n_soundscape_train
@@ -198,52 +200,29 @@ def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.1,
         sample_rate=sample_rate, clip_duration=clip_duration
     )
 
-    if val_sites:
-        # Site-based split: soundscapes from val_sites go to val, rest to train
-        val_sites_set = set(val_sites)
-        sc_train_indices = []
-        sc_val_indices = []
-        for i, entry in enumerate(soundscape_ds.entries):
-            if entry["site_id"] in val_sites_set:
-                sc_val_indices.append(i)
-            else:
-                sc_train_indices.append(i)
+    # Random split of soundscape segments only
+    n_sc = len(soundscape_ds)
+    n_sc_val = int(n_sc * val_frac)
+    n_sc_train = n_sc - n_sc_val
 
-        sc_train = torch.utils.data.Subset(soundscape_ds, sc_train_indices)
-        sc_val = torch.utils.data.Subset(soundscape_ds, sc_val_indices)
+    generator = torch.Generator().manual_seed(seed)
+    sc_train, sc_val = torch.utils.data.random_split(
+        soundscape_ds, [n_sc_train, n_sc_val], generator=generator
+    )
 
-        # All train_audio goes to training
-        train_ds = ConcatDataset([audio_ds, sc_train])
-        val_ds = sc_val
+    # Train = all train_audio + train soundscape segments
+    train_ds = ConcatDataset([audio_ds, sc_train])
+    val_ds = sc_val
 
-        all_sites = set(e["site_id"] for e in soundscape_ds.entries)
-        logger.info(f"Site-based split: val_sites={val_sites}, "
-                    f"all_sites={sorted(all_sites)}")
-        logger.info(f"Train: {len(audio_ds)} audio + {len(sc_train_indices)} soundscape, "
-                    f"Val: {len(sc_val_indices)} soundscape segments")
+    logger.info(f"Train: {len(audio_ds)} audio + {n_sc_train} soundscape, "
+                f"Val: {n_sc_val} soundscape segments")
 
-        return train_ds, val_ds, label_map, num_classes, len(audio_ds), len(sc_train_indices)
-    else:
-        # Random split (legacy)
-        combined = ConcatDataset([audio_ds, soundscape_ds])
-        total = len(combined)
-        val_size = int(total * val_frac)
-        train_size = total - val_size
-
-        generator = torch.Generator().manual_seed(seed)
-        train_ds, val_ds = torch.utils.data.random_split(
-            combined, [train_size, val_size], generator=generator
-        )
-
-        logger.info(f"Random split — Train: {train_size}, Val: {val_size} "
-                    f"(audio: {len(audio_ds)}, soundscape: {len(soundscape_ds)})")
-
-        return train_ds, val_ds, label_map, num_classes, len(audio_ds), len(soundscape_ds)
+    return train_ds, val_ds, label_map, num_classes, len(audio_ds), n_sc_train
 
 
 def get_dataloaders(data_dir, batch_size=32, num_workers=4, sample_rate=32000,
-                    clip_duration=10.0, val_frac=0.1, seed=42,
-                    val_sites=None, soundscape_weight=3.0):
+                    clip_duration=10.0, val_frac=0.15, seed=42,
+                    soundscape_weight=3.0):
     """
     Convenience function returning DataLoaders ready for training.
 
@@ -252,7 +231,7 @@ def get_dataloaders(data_dir, batch_size=32, num_workers=4, sample_rate=32000,
     """
     train_ds, val_ds, label_map, num_classes, n_audio, n_soundscape = get_datasets(
         data_dir, sample_rate=sample_rate, clip_duration=clip_duration,
-        val_frac=val_frac, seed=seed, val_sites=val_sites
+        val_frac=val_frac, seed=seed
     )
 
     # Build WeightedRandomSampler to upweight soundscape data in training
@@ -299,4 +278,4 @@ def get_dataloaders(data_dir, batch_size=32, num_workers=4, sample_rate=32000,
         prefetch_factor=4 if num_workers > 0 else None,
     )
 
-    return train_loader, val_loader, label_map, num_classes
+    return train_loader, val_loader, label_map, num_classes, n_audio

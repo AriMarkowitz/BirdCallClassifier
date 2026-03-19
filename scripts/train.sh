@@ -76,12 +76,9 @@ python src/train.py \
     --batch_size 128 \
     --num_workers 8 \
     --max_epochs 50 \
-    --lr 1e-3 \
-    --warmup_epochs 1 \
-    --gpus 1 \
+    --lr 1e-4 \
     --save_dir "$CKPT_DIR" \
     --seed "$SEED" \
-    --val_sites S22 S23 \
     --soundscape_weight 3.0 \
     --use_wandb \
     --wandb_project birdclef-2026 \
