@@ -201,6 +201,8 @@ def main():
     parser.add_argument("--save_dir", type=str,
                         default=os.path.join(PROJ_ROOT, "checkpoints"))
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--resume_from", type=str, default=None,
+                        help="Path to Lightning checkpoint to resume training from")
     args = parser.parse_args()
 
     pl.seed_everything(args.seed)
@@ -251,10 +253,10 @@ def main():
         callbacks=[ckpt_callback, lr_monitor],
         default_root_dir=args.save_dir,
         log_every_n_steps=50,
-        precision=16,  # mixed precision for memory efficiency
+        precision=32,  # fp32 to avoid BCELoss + AMP issues
     )
 
-    trainer.fit(wrapper, train_loader, val_loader)
+    trainer.fit(wrapper, train_loader, val_loader, ckpt_path=args.resume_from)
 
 
 if __name__ == "__main__":

@@ -60,21 +60,25 @@ if [ ! -f "$CKPT_PATH" ]; then
     echo "Downloading AudioSet pretrained HTSAT checkpoint..."
     pip install -q gdown
     # HTSAT-tiny AudioSet checkpoint from the original repo
-    gdown "https://drive.google.com/uc?id=1HE9KQBGLFWMZ0CwG_USbpMc7o4lEzRiN" \
+    gdown "https://drive.google.com/uc?id=1OK8a5XuMVLyeVKF117L8pfxeZYdfSDZv" \
         -O "$CKPT_PATH" || echo "WARNING: Checkpoint download failed. Will train from scratch."
 fi
 
 # ── Run training ──
+# Resume from best Lightning checkpoint if available, otherwise train from pretrained
+RESUME_CKPT=$(ls -t "$CKPT_DIR"/birdclef-htsat-*.ckpt 2>/dev/null | head -1)
+
 python src/train.py \
     --data_dir "$PROJECT_DIR/data" \
     --checkpoint "$CKPT_PATH" \
     --batch_size 32 \
     --num_workers 8 \
-    --max_epochs 30 \
+    --max_epochs 50 \
     --lr 1e-4 \
     --warmup_epochs 1 \
     --gpus 1 \
     --save_dir "$CKPT_DIR" \
-    --seed 42
+    --seed 42 \
+    ${RESUME_CKPT:+--resume_from "$RESUME_CKPT"}
 
 echo "Training complete."
