@@ -6,16 +6,18 @@ Usage:
 
 Key adjustments from AudioSet defaults:
   - classes_num: 234 (from taxonomy.csv)
-  - Warmup reduced: 1 epoch at 0.1x LR, then cosine decay (AudioSet warmup
-    was tuned for 2M+ samples and will overshoot on smaller data)
-  - Lower LR: 1e-4 (not 1e-3) since we're fine-tuning, not training from scratch
+  - Warmup reduced: 1 epoch at 0.1x LR, then cosine decay
+  - Lower LR: 3e-5 default (fine-tuning, not training from scratch)
   - Batch size: 32 (single GPU default)
+  - Site-based validation split for realistic eval
+  - WeightedRandomSampler to upweight soundscape data
 """
 
 import os
 import sys
 import argparse
 import logging
+import math
 
 import torch
 import torch.nn as nn
@@ -56,10 +58,8 @@ def load_pretrained_htsat(checkpoint_path, config, num_classes):
 
     if checkpoint_path and os.path.isfile(checkpoint_path):
         ckpt = torch.load(checkpoint_path, map_location="cpu")
-        # Handle both raw state_dict and Lightning checkpoint formats
         if "state_dict" in ckpt:
             state_dict = ckpt["state_dict"]
-            # Strip "sed_model." prefix if present (from SEDWrapper)
             state_dict = {
                 k.replace("sed_model.", ""): v
                 for k, v in state_dict.items()
@@ -67,7 +67,6 @@ def load_pretrained_htsat(checkpoint_path, config, num_classes):
         else:
             state_dict = ckpt
 
-        # Load everything except head / tscam_conv (class-count mismatch)
         filtered = {
             k: v for k, v in state_dict.items()
             if "head" not in k and "tscam_conv" not in k
@@ -78,7 +77,7 @@ def load_pretrained_htsat(checkpoint_path, config, num_classes):
     else:
         logger.warning("No checkpoint provided — training from scratch.")
 
-    # Now rebuild with correct num_classes
+    # Rebuild with correct num_classes
     model = HTSAT_Swin_Transformer(
         spec_size=config.htsat_spec_size,
         patch_size=config.htsat_patch_size,
@@ -91,7 +90,7 @@ def load_pretrained_htsat(checkpoint_path, config, num_classes):
         config=config,
     )
 
-    # Copy backbone weights from model_527 to model (everything except head/tscam)
+    # Copy backbone weights
     src_dict = model_527.state_dict()
     tgt_dict = model.state_dict()
     for k in tgt_dict:
@@ -106,10 +105,9 @@ def load_pretrained_htsat(checkpoint_path, config, num_classes):
 class BirdCLEFWrapper(pl.LightningModule):
     """
     Lightning wrapper for HTSAT fine-tuning on BirdCLEF.
-    Adapted from SEDWrapper with warmup/LR adjustments for small datasets.
     """
 
-    def __init__(self, sed_model, config, num_classes, learning_rate=1e-4,
+    def __init__(self, sed_model, config, num_classes, learning_rate=3e-5,
                  warmup_epochs=1, max_epochs=30):
         super().__init__()
         self.sed_model = sed_model
@@ -124,15 +122,25 @@ class BirdCLEFWrapper(pl.LightningModule):
         output_dict = self.sed_model(x, mix_lambda)
         return output_dict["clipwise_output"], output_dict["framewise_output"]
 
+    def _safe_loss(self, pred, target):
+        """Clamp predictions to [eps, 1-eps] and compute BCE in fp32."""
+        with torch.amp.autocast("cuda", enabled=False):
+            pred = pred.float().clamp(1e-6, 1.0 - 1e-6)
+            target = target.float()
+            return self.loss_fn(pred, target)
+
     def training_step(self, batch, batch_idx):
         pred, _ = self(batch["waveform"])
-        loss = self.loss_fn(pred, batch["target"])
+        loss = self._safe_loss(pred, batch["target"])
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        if batch_idx % 50 == 0:
+            logger.info(f"Step {self.global_step} (epoch {self.current_epoch}, "
+                        f"batch {batch_idx}): train_loss={loss.item():.4f}")
         return loss
 
     def validation_step(self, batch, batch_idx):
         pred, _ = self(batch["waveform"])
-        loss = self.loss_fn(pred, batch["target"])
+        loss = self._safe_loss(pred, batch["target"])
         self.log("val_loss", loss, on_epoch=True, prog_bar=True)
         return {"pred": pred.detach(), "target": batch["target"].detach()}
 
@@ -143,8 +151,6 @@ class BirdCLEFWrapper(pl.LightningModule):
         preds = torch.cat([o["pred"] for o in outputs]).cpu().numpy()
         targets = torch.cat([o["target"] for o in outputs]).cpu().numpy()
 
-        # Macro-averaged ROC-AUC, ignoring classes with no positive labels
-        # (matches the Kaggle competition evaluation metric)
         try:
             col_mask = targets.sum(axis=0) > 0
             if col_mask.any():
@@ -168,33 +174,19 @@ class BirdCLEFWrapper(pl.LightningModule):
             weight_decay=0.05,
         )
 
-        # Cosine schedule with linear warmup
-        # Much gentler than the AudioSet 3-epoch aggressive warmup
-        def lr_lambda(epoch):
-            if epoch < self.warmup_epochs:
-                return 0.1 + 0.9 * (epoch / max(self.warmup_epochs, 1))
-            progress = (epoch - self.warmup_epochs) / max(
-                self.max_epochs - self.warmup_epochs, 1
-            )
-            return max(0.01, 0.5 * (1.0 + __import__("math").cos(
-                __import__("math").pi * progress
-            )))
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-        return [optimizer], [scheduler]
+        return optimizer
 
 
 def main():
     parser = argparse.ArgumentParser(description="Fine-tune HTSAT on BirdCLEF 2026")
     parser.add_argument("--data_dir", type=str,
-                        default=os.path.join(PROJ_ROOT, "data"),
-                        help="Path to data/ directory")
+                        default=os.path.join(PROJ_ROOT, "data"))
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to AudioSet pretrained HTSAT checkpoint")
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--max_epochs", type=int, default=30)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--max_epochs", type=int, default=50)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--warmup_epochs", type=int, default=1)
     parser.add_argument("--gpus", type=int, default=1)
     parser.add_argument("--val_frac", type=float, default=0.1)
@@ -203,6 +195,17 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume_from", type=str, default=None,
                         help="Path to Lightning checkpoint to resume training from")
+    # New args
+    parser.add_argument("--val_sites", type=str, nargs="+", default=["S22", "S23"],
+                        help="Site IDs to hold out for validation (e.g. S22 S23)")
+    parser.add_argument("--soundscape_weight", type=float, default=3.0,
+                        help="Upweight soundscape samples in training sampler")
+    parser.add_argument("--use_wandb", action="store_true",
+                        help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb_project", type=str, default="birdclef-2026",
+                        help="W&B project name")
+    parser.add_argument("--run_name", type=str, default=None,
+                        help="W&B run name (defaults to auto-generated)")
     args = parser.parse_args()
 
     pl.seed_everything(args.seed)
@@ -223,6 +226,8 @@ def main():
         clip_duration=htsat_config.clip_samples / htsat_config.sample_rate,
         val_frac=args.val_frac,
         seed=args.seed,
+        val_sites=args.val_sites,
+        soundscape_weight=args.soundscape_weight,
     )
     logger.info(f"Classes: {num_classes}, Train batches: {len(train_loader)}, "
                 f"Val batches: {len(val_loader)}")
@@ -237,9 +242,13 @@ def main():
         max_epochs=args.max_epochs,
     )
 
+    # Save each seed's checkpoints in a subdirectory
+    seed_save_dir = os.path.join(args.save_dir, f"seed{args.seed}")
+    os.makedirs(seed_save_dir, exist_ok=True)
+
     # Callbacks
     ckpt_callback = ModelCheckpoint(
-        dirpath=args.save_dir,
+        dirpath=seed_save_dir,
         filename="birdclef-htsat-{epoch:02d}-{val_macro_auc:.4f}",
         monitor="val_macro_auc",
         mode="max",
@@ -247,13 +256,35 @@ def main():
     )
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
 
+    # Logger
+    loggers = []
+    if args.use_wandb:
+        from pytorch_lightning.loggers import WandbLogger
+        wandb_logger = WandbLogger(
+            project=args.wandb_project,
+            name=args.run_name,
+            config={
+                "lr": args.lr,
+                "batch_size": args.batch_size,
+                "max_epochs": args.max_epochs,
+                "seed": args.seed,
+                "val_sites": args.val_sites,
+                "soundscape_weight": args.soundscape_weight,
+                "warmup_epochs": args.warmup_epochs,
+                "model": "htsat-tiny",
+            },
+        )
+        loggers.append(wandb_logger)
+
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         gpus=args.gpus,
         callbacks=[ckpt_callback, lr_monitor],
+        logger=loggers if loggers else True,
         default_root_dir=args.save_dir,
         log_every_n_steps=50,
-        precision=32,  # fp32 to avoid BCELoss + AMP issues
+        precision=32,
+        enable_progress_bar=False,
     )
 
     trainer.fit(wrapper, train_loader, val_loader, ckpt_path=args.resume_from)

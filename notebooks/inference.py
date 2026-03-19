@@ -1,6 +1,7 @@
 """
 BirdCLEF 2026 — Kaggle Inference Notebook
 HTSAT-tiny fine-tuned on BirdCLEF 2026 training data.
+Supports multi-model ensemble (averages predictions across all checkpoints).
 
 Constraints: CPU-only, no internet, 90-minute limit.
 """
@@ -21,7 +22,6 @@ import soundfile as sf
 import librosa
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-# Check known Kaggle mount locations (avoid slow os.walk over audio files)
 _INPUT = "/kaggle/input"
 
 # Competition data
@@ -42,23 +42,21 @@ for p in [f"{_INPUT}/birdclef-2026-model",
 assert COMPETITION_DATA, f"Competition data not found. /kaggle/input contains: {os.listdir(_INPUT)}"
 assert MODEL_DATASET, f"Model dataset not found. /kaggle/input contains: {os.listdir(_INPUT)}"
 
-# Find checkpoint (Kaggle strips '=' from filenames)
-CHECKPOINT_PATH = None
-for f in os.listdir(MODEL_DATASET):
-    if f.startswith("birdclef-htsat-") and f.endswith(".ckpt"):
-        CHECKPOINT_PATH = os.path.join(MODEL_DATASET, f)
-        break
+# Find all checkpoints for ensemble
+CHECKPOINT_PATHS = sorted(glob.glob(os.path.join(MODEL_DATASET, "birdclef-htsat-*.ckpt")))
 
 HTSAT_CODE_DIR = os.path.join(MODEL_DATASET, "htsat")
 TAXONOMY_PATH = os.path.join(COMPETITION_DATA, "taxonomy.csv")
 
 print(f"Competition data: {COMPETITION_DATA}")
 print(f"Model dataset: {MODEL_DATASET}")
-print(f"Checkpoint: {CHECKPOINT_PATH}")
+print(f"Checkpoints found: {len(CHECKPOINT_PATHS)}")
+for cp in CHECKPOINT_PATHS:
+    print(f"  - {os.path.basename(cp)}")
 print(f"HTSAT code: {HTSAT_CODE_DIR}")
 print(f"Taxonomy: {TAXONOMY_PATH}")
 
-assert CHECKPOINT_PATH, "Checkpoint not found"
+assert len(CHECKPOINT_PATHS) > 0, "No checkpoints found"
 assert os.path.isdir(HTSAT_CODE_DIR), f"HTSAT code dir not found: {HTSAT_CODE_DIR}"
 assert os.path.isfile(TAXONOMY_PATH), f"Taxonomy not found: {TAXONOMY_PATH}"
 
@@ -151,11 +149,15 @@ def load_model(checkpoint_path):
     state_dict = {k.replace("sed_model.", ""): v for k, v in state_dict.items()}
     model.load_state_dict(state_dict, strict=True)
     model.eval()
-    print("Model loaded.")
     return model
 
 
-model = load_model(CHECKPOINT_PATH)
+# Load all models for ensemble
+models = []
+for cp in CHECKPOINT_PATHS:
+    print(f"Loading {os.path.basename(cp)} ...")
+    models.append(load_model(cp))
+print(f"Loaded {len(models)} models for ensemble.")
 
 
 # ── Audio helpers ──────────────────────────────────────────────────────────────
@@ -184,11 +186,18 @@ def pad_to_clip(segment):
 
 # ── Inference ──────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def predict_batch(model, waveforms):
+def predict_batch_ensemble(models, waveforms):
+    """Run inference with all models and average predictions."""
     x = torch.from_numpy(waveforms).float()
-    output_dict = model(x)
-    probs = output_dict["clipwise_output"].cpu().numpy()
-    return probs
+    probs_sum = None
+    for model in models:
+        output_dict = model(x)
+        probs = output_dict["clipwise_output"].cpu().numpy()
+        if probs_sum is None:
+            probs_sum = probs
+        else:
+            probs_sum += probs
+    return probs_sum / len(models)
 
 
 # ── Main loop ──────────────────────────────────────────────────────────────────
@@ -233,7 +242,7 @@ def main():
         segments = np.stack(segments, axis=0)
         for batch_start in range(0, len(segments), BATCH_SIZE):
             batch = segments[batch_start : batch_start + BATCH_SIZE]
-            probs = predict_batch(model, batch)
+            probs = predict_batch_ensemble(models, batch)
             for j in range(len(probs)):
                 results.append((row_ids[batch_start + j], probs[j]))
 

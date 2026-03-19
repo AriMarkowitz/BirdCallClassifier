@@ -7,8 +7,8 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=64G
 #SBATCH --time=12:00:00
-#SBATCH --output=logs/birdclef_%j.out
-#SBATCH --error=logs/birdclef_%j.err
+#SBATCH --output=logs/birdclef_%j.log
+#SBATCH --error=logs/birdclef_%j.log
 
 # ── Project paths ──
 PROJECT_DIR="$HOME/BirdCallClassifier"
@@ -40,6 +40,9 @@ else
     conda activate "$ENV_NAME"
 fi
 
+# Install wandb if not present
+pip install -q wandb
+
 # ── Print environment info ──
 echo "Job ID: $SLURM_JOB_ID"
 echo "Node: $SLURM_NODELIST"
@@ -59,26 +62,29 @@ mkdir -p "$CKPT_DIR"
 if [ ! -f "$CKPT_PATH" ]; then
     echo "Downloading AudioSet pretrained HTSAT checkpoint..."
     pip install -q gdown
-    # HTSAT-tiny AudioSet checkpoint from the original repo
     gdown "https://drive.google.com/uc?id=1OK8a5XuMVLyeVKF117L8pfxeZYdfSDZv" \
         -O "$CKPT_PATH" || echo "WARNING: Checkpoint download failed. Will train from scratch."
 fi
 
-# ── Run training ──
-# Resume from best Lightning checkpoint if available, otherwise train from pretrained
-RESUME_CKPT=$(ls -t "$CKPT_DIR"/birdclef-htsat-*.ckpt 2>/dev/null | head -1)
+# ── Ensemble seed (override via environment: SEED=123 sbatch train.sh) ──
+SEED="${SEED:-42}"
 
+# ── Run training ──
 python src/train.py \
     --data_dir "$PROJECT_DIR/data" \
     --checkpoint "$CKPT_PATH" \
-    --batch_size 32 \
+    --batch_size 128 \
     --num_workers 8 \
     --max_epochs 50 \
-    --lr 1e-4 \
+    --lr 1e-3 \
     --warmup_epochs 1 \
     --gpus 1 \
     --save_dir "$CKPT_DIR" \
-    --seed 42 \
-    ${RESUME_CKPT:+--resume_from "$RESUME_CKPT"}
+    --seed "$SEED" \
+    --val_sites S22 S23 \
+    --soundscape_weight 3.0 \
+    --use_wandb \
+    --wandb_project birdclef-2026 \
+    --run_name "htsat-seed${SEED}"
 
-echo "Training complete."
+echo "Training complete (seed=$SEED)."

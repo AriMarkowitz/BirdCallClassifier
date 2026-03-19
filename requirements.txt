@@ -27,6 +27,7 @@ h5py
 # Logging
 tensorboard
 tqdm
+wandb
 
 # HTSAT dependency (museval used in utils.py)
 museval

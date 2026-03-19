@@ -6,3 +6,4 @@ checkpoints/*
 kaggle_dataset/*
 __pycache__/
 *.pyc
+wandb/*
