@@ -197,11 +197,13 @@ def segment_audio(audio):
     return segments
 
 
+
 # ── Inference ──────────────────────────────────────────────────────────────────
 def predict_batch_ensemble(models, waveforms):
     """Run inference with all models and average predictions."""
     x = torch.from_numpy(waveforms)
-    probs_sum = np.zeros((len(waveforms), NUM_CLASSES), dtype=np.float32)
+    batch_size = len(waveforms)
+    probs_sum = np.zeros((batch_size, NUM_CLASSES), dtype=np.float32)
     for model in models:
         output_dict = model(x)
         probs_sum += output_dict["clipwise_output"].numpy()

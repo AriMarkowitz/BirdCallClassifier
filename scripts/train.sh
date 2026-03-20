@@ -66,12 +66,13 @@ if [ ! -f "$CKPT_PATH" ]; then
         -O "$CKPT_PATH" || echo "WARNING: Checkpoint download failed. Will train from scratch."
 fi
 
-# ── Ensemble seed (override via environment: SEED=123 sbatch train.sh) ──
+# ── Fold and seed (override via environment: FOLD=2 sbatch train.sh) ──
+FOLD="${FOLD:-0}"
 SEED="${SEED:-42}"
 
 # ── Run training ──
 JOB_ID="${SLURM_JOB_ID:-local_$(date +%Y%m%d_%H%M%S)}"
-RUN_ID="${JOB_ID}_seed${SEED}"
+RUN_ID="${JOB_ID}_fold${FOLD}"
 
 python src/train.py \
     --data_dir "$PROJECT_DIR/data" \
@@ -83,9 +84,12 @@ python src/train.py \
     --save_dir "$CKPT_DIR" \
     --seed "$SEED" \
     --soundscape_weight 3.0 \
+    --label_smoothing 0.1 \
+    --n_folds 5 \
+    --fold "$FOLD" \
     --use_wandb \
     --wandb_project birdclef-2026 \
     --run_name "htsat-${RUN_ID}" \
     --run_id "$RUN_ID"
 
-echo "Training complete (run=$RUN_ID)."
+echo "Training complete (run=$RUN_ID, fold=$FOLD)."

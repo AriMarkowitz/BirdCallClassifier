@@ -98,25 +98,19 @@ for i in $(seq 1 60); do
 done
 echo ""
 
-# ── Step 4: Download output and submit ────────────────────────────────────────
-echo "=== Step 4: Downloading output and submitting ==="
-SUBMISSION_DIR=$(mktemp -d)
-kaggle kernels output "$KERNEL_SLUG" -p "$SUBMISSION_DIR"
-
-SUBMISSION_FILE="$SUBMISSION_DIR/submission.csv"
-if [ ! -f "$SUBMISSION_FILE" ]; then
-    echo "ERROR: submission.csv not found in notebook output"
-    ls "$SUBMISSION_DIR/"
-    exit 1
-fi
-
-ROWS=$(wc -l < "$SUBMISSION_FILE")
-echo "Submission has $ROWS rows"
-
-kaggle competitions submit -c "$COMPETITION" -f "$SUBMISSION_FILE" -m "Ensemble: ${CKPT_COUNT} models"
+# ── Step 4: Submit to competition ─────────────────────────────────────────────
+# For code competitions, the notebook IS the submission — Kaggle re-runs it
+# against the hidden test set. We can't submit the CSV directly.
+echo "=== Step 4: Submitting notebook to competition ==="
 echo ""
-echo "=== Done! Check your score at: ==="
-echo "https://www.kaggle.com/competitions/$COMPETITION/leaderboard"
-
-# Cleanup
-rm -rf "$SUBMISSION_DIR"
+echo "Notebook ran successfully. Now submit it to the competition:"
+echo ""
+echo "  1. Go to: https://www.kaggle.com/code/arimarkowitz/birdclef-2026-inference"
+echo "  2. Click the latest version under 'Output'"
+echo "  3. Click 'Submit to Competition'"
+echo ""
+echo "Or re-run via the Kaggle UI:"
+echo "  1. Open notebook → Edit → Save Version → Save & Run All"
+echo "  2. After completion → Output → Submit to Competition"
+echo ""
+echo "=== Done! ==="

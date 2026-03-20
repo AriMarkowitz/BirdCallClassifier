@@ -213,9 +213,11 @@ class BirdCLEFWrapper(pl.LightningModule):
                 logger.warning("Curriculum: could not find WeightedRandomSampler, skipping")
             return
 
-        # Curriculum schedule: ramp soundscape weight from 0.5 to 5.0
+        # Curriculum schedule: ramp soundscape weight from 0.5 to 3.0
+        # Start with clean audio focus so model learns individual species,
+        # then ramp up soundscapes to learn noisy multi-species detection
         progress = self.current_epoch / max(self.max_epochs - 1, 1)
-        weight = 0.5 + 4.5 * progress  # 0.5 at epoch 0, 5.0 at final epoch
+        weight = 0.5 + 2.5 * progress  # 0.5 at epoch 0, 3.0 at final epoch
 
         n_total = len(sampler.weights)
         new_weights = torch.ones(n_total, dtype=torch.float64)
@@ -245,6 +247,8 @@ def main():
                         help="Path to Lightning checkpoint to resume training from")
     parser.add_argument("--soundscape_weight", type=float, default=3.0,
                         help="Upweight soundscape samples in training sampler")
+    parser.add_argument("--label_smoothing", type=float, default=0.1,
+                        help="Label smoothing factor (0=hard labels, 0.1=recommended)")
     parser.add_argument("--use_wandb", action="store_true",
                         help="Enable Weights & Biases logging")
     parser.add_argument("--wandb_project", type=str, default="birdclef-2026",
@@ -253,6 +257,10 @@ def main():
                         help="W&B run name (defaults to auto-generated)")
     parser.add_argument("--run_id", type=str, default=None,
                         help="Run ID for checkpoint subdir (defaults to seed<N>)")
+    parser.add_argument("--n_folds", type=int, default=5,
+                        help="Number of CV folds")
+    parser.add_argument("--fold", type=int, default=0,
+                        help="Which fold to hold out for validation (0 to n_folds-1)")
     args = parser.parse_args()
 
     pl.seed_everything(args.seed)
@@ -277,18 +285,21 @@ def main():
         val_frac=args.val_frac,
         seed=args.seed,
         soundscape_weight=args.soundscape_weight,
+        label_smoothing=args.label_smoothing,
+        n_folds=args.n_folds,
+        fold=args.fold,
     )
     logger.info(f"Classes: {num_classes}, Train batches: {len(train_loader)}, "
                 f"Val batches: {len(val_loader)}")
 
     # Curriculum schedule summary
-    logger.info(f"Curriculum training: soundscape_weight ramps 0.50 -> 5.00 "
+    logger.info(f"Curriculum training: soundscape_weight ramps 0.50 -> 3.00 "
                 f"linearly over {args.max_epochs} epochs")
-    logger.info(f"  Epoch 0: weight=0.50 (mostly clean audio)")
+    logger.info(f"  Epoch 0: weight=0.50 (clean audio focus)")
     mid = args.max_epochs // 2
     mid_w = 0.5 + 4.5 * (mid / max(args.max_epochs - 1, 1))
     logger.info(f"  Epoch {mid}: weight={mid_w:.2f}")
-    logger.info(f"  Epoch {args.max_epochs - 1}: weight=5.00 (heavy soundscape focus)")
+    logger.info(f"  Epoch {args.max_epochs - 1}: weight=3.00 (soundscape focus)")
 
     # Build model
     htsat_config.classes_num = num_classes
@@ -332,6 +343,9 @@ def main():
                 "val_frac": args.val_frac,
                 "soundscape_weight": args.soundscape_weight,
                 "warmup_epochs": args.warmup_epochs,
+                "label_smoothing": args.label_smoothing,
+                "fold": args.fold,
+                "n_folds": args.n_folds,
                 "model": "htsat-tiny",
             },
         )

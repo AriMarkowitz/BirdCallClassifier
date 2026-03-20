@@ -1,12 +1,13 @@
 #!/bin/bash
-# Launch 5 training jobs with different seeds for ensemble.
+# Launch 5-fold CV ensemble training.
+# Each job trains on 4/5 of soundscape data, validates on the remaining 1/5.
 # Usage: bash scripts/train_ensemble.sh
 
-SEEDS=(42 123 456 789 2026)
+N_FOLDS=5
 
-for seed in "${SEEDS[@]}"; do
-    echo "Submitting seed=$seed ..."
-    SEED=$seed sbatch scripts/train.sh
+for fold in $(seq 0 $((N_FOLDS - 1))); do
+    echo "Submitting fold=$fold ..."
+    FOLD=$fold sbatch scripts/train.sh
 done
 
-echo "All ${#SEEDS[@]} ensemble jobs submitted."
+echo "All $N_FOLDS fold jobs submitted."

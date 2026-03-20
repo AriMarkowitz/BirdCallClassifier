@@ -43,12 +43,13 @@ class TrainAudioDataset(Dataset):
     """
 
     def __init__(self, csv_path, audio_dir, label_map, sample_rate=32000,
-                 clip_duration=10.0):
+                 clip_duration=10.0, label_smoothing=0.0):
         self.audio_dir = audio_dir
         self.label_map = label_map
         self.sample_rate = sample_rate
         self.clip_samples = int(sample_rate * clip_duration)
         self.num_classes = len(label_map)
+        self.label_smoothing = label_smoothing
 
         df = pd.read_csv(csv_path)
         df["primary_label"] = df["primary_label"].astype(str)
@@ -56,14 +57,32 @@ class TrainAudioDataset(Dataset):
         self.filenames = df["filename"].values
         self.labels = df["primary_label"].values
 
+        # Parse secondary labels
+        import ast
+        self.secondary_labels = []
+        for val in df["secondary_labels"].values:
+            sec = []
+            try:
+                parsed = ast.literal_eval(str(val))
+                for lbl in parsed:
+                    lbl = str(lbl).strip()
+                    if lbl in label_map:
+                        sec.append(label_map[lbl])
+            except (ValueError, SyntaxError):
+                pass
+            self.secondary_labels.append(sec)
+
     def __len__(self):
         return len(self.filenames)
 
     def __getitem__(self, index):
         filepath = os.path.join(self.audio_dir, self.filenames[index])
         waveform = self._load_audio(filepath)
-        target = np.zeros(self.num_classes, dtype=np.float32)
-        target[self.label_map[self.labels[index]]] = 1.0
+        eps = self.label_smoothing
+        target = np.full(self.num_classes, eps / self.num_classes, dtype=np.float32)
+        target[self.label_map[self.labels[index]]] = 1.0 - eps
+        for idx in self.secondary_labels[index]:
+            target[idx] = 1.0 - eps
         return {"waveform": waveform, "target": target}
 
     def _load_audio(self, path):
@@ -105,12 +124,13 @@ class SoundscapeDataset(Dataset):
     """
 
     def __init__(self, labels_csv, soundscape_dir, label_map, sample_rate=32000,
-                 clip_duration=10.0):
+                 clip_duration=10.0, label_smoothing=0.0):
         self.soundscape_dir = soundscape_dir
         self.label_map = label_map
         self.sample_rate = sample_rate
         self.clip_samples = int(sample_rate * clip_duration)
         self.num_classes = len(label_map)
+        self.label_smoothing = label_smoothing
 
         df = pd.read_csv(labels_csv)
         self.entries = []
@@ -160,23 +180,28 @@ class SoundscapeDataset(Dataset):
             repeats = (self.clip_samples // max(len(audio), 1)) + 1
             audio = np.tile(audio, repeats)[:self.clip_samples]
 
-        target = np.zeros(self.num_classes, dtype=np.float32)
+        eps = self.label_smoothing
+        target = np.full(self.num_classes, eps / self.num_classes, dtype=np.float32)
         for idx in entry["label_indices"]:
-            target[idx] = 1.0
+            target[idx] = 1.0 - eps
 
         return {"waveform": audio, "target": target}
 
 
 def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
-                 seed=42):
+                 seed=42, label_smoothing=0.0, n_folds=5, fold=0):
     """
-    Build train/val datasets.
+    Build train/val datasets using k-fold cross-validation on soundscape segments.
 
-    Train = all train_audio + (1-val_frac) of soundscape segments.
-    Val   = val_frac of soundscape segments (random split).
+    Train = all train_audio + (k-1)/k of soundscape segments.
+    Val   = 1/k of soundscape segments (fold-based split).
 
-    This ensures val reflects real test conditions (noisy multi-species audio)
-    while training sees all sites and all train_audio.
+    Each fold holds out a different 20% of soundscapes, so every segment is
+    validated exactly once across all folds.
+
+    Args:
+        n_folds: number of CV folds (default 5)
+        fold: which fold to hold out for validation (0 to n_folds-1)
 
     Returns:
         train_dataset, val_dataset, label_map, num_classes, n_train_audio, n_soundscape_train
@@ -193,36 +218,51 @@ def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
 
     audio_ds = TrainAudioDataset(
         train_csv, audio_dir, label_map,
-        sample_rate=sample_rate, clip_duration=clip_duration
+        sample_rate=sample_rate, clip_duration=clip_duration,
+        label_smoothing=label_smoothing,
     )
-    soundscape_ds = SoundscapeDataset(
+    # Train soundscapes use label smoothing; val soundscapes use hard labels
+    soundscape_ds_train = SoundscapeDataset(
         soundscape_csv, soundscape_dir, label_map,
-        sample_rate=sample_rate, clip_duration=clip_duration
+        sample_rate=sample_rate, clip_duration=clip_duration,
+        label_smoothing=label_smoothing,
+    )
+    soundscape_ds_val = SoundscapeDataset(
+        soundscape_csv, soundscape_dir, label_map,
+        sample_rate=sample_rate, clip_duration=clip_duration,
+        label_smoothing=0.0,  # hard labels for accurate AUC
     )
 
-    # Random split of soundscape segments only
-    n_sc = len(soundscape_ds)
-    n_sc_val = int(n_sc * val_frac)
-    n_sc_train = n_sc - n_sc_val
+    # K-fold split of soundscape segments
+    n_sc = len(soundscape_ds_train)
+    indices = np.arange(n_sc)
+    # Deterministic shuffle so folds are consistent across runs
+    rng = np.random.RandomState(42)  # always use 42 for fold assignment
+    rng.shuffle(indices)
 
-    generator = torch.Generator().manual_seed(seed)
-    sc_train, sc_val = torch.utils.data.random_split(
-        soundscape_ds, [n_sc_train, n_sc_val], generator=generator
-    )
+    fold_size = n_sc // n_folds
+    val_start = fold * fold_size
+    val_end = val_start + fold_size if fold < n_folds - 1 else n_sc
+    val_indices = indices[val_start:val_end]
+    train_indices = np.concatenate([indices[:val_start], indices[val_end:]])
+
+    sc_train = torch.utils.data.Subset(soundscape_ds_train, train_indices.tolist())
+    sc_val = torch.utils.data.Subset(soundscape_ds_val, val_indices.tolist())
 
     # Train = all train_audio + train soundscape segments
     train_ds = ConcatDataset([audio_ds, sc_train])
     val_ds = sc_val
 
-    logger.info(f"Train: {len(audio_ds)} audio + {n_sc_train} soundscape, "
-                f"Val: {n_sc_val} soundscape segments")
+    logger.info(f"Fold {fold}/{n_folds}: Train = {len(audio_ds)} audio + {len(sc_train)} soundscape, "
+                f"Val = {len(sc_val)} soundscape segments")
 
-    return train_ds, val_ds, label_map, num_classes, len(audio_ds), n_sc_train
+    return train_ds, val_ds, label_map, num_classes, len(audio_ds), len(sc_train)
 
 
 def get_dataloaders(data_dir, batch_size=32, num_workers=4, sample_rate=32000,
                     clip_duration=10.0, val_frac=0.25, seed=42,
-                    soundscape_weight=3.0):
+                    soundscape_weight=3.0, label_smoothing=0.0,
+                    n_folds=5, fold=0):
     """
     Convenience function returning DataLoaders ready for training.
 
@@ -231,7 +271,8 @@ def get_dataloaders(data_dir, batch_size=32, num_workers=4, sample_rate=32000,
     """
     train_ds, val_ds, label_map, num_classes, n_audio, n_soundscape = get_datasets(
         data_dir, sample_rate=sample_rate, clip_duration=clip_duration,
-        val_frac=val_frac, seed=seed
+        val_frac=val_frac, seed=seed, label_smoothing=label_smoothing,
+        n_folds=n_folds, fold=fold,
     )
 
     # Build WeightedRandomSampler to upweight soundscape data in training
