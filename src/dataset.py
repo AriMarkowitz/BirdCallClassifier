@@ -167,7 +167,7 @@ class SoundscapeDataset(Dataset):
         return {"waveform": audio, "target": target}
 
 
-def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.15,
+def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
                  seed=42):
     """
     Build train/val datasets.
@@ -221,7 +221,7 @@ def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.15,
 
 
 def get_dataloaders(data_dir, batch_size=32, num_workers=4, sample_rate=32000,
-                    clip_duration=10.0, val_frac=0.15, seed=42,
+                    clip_duration=10.0, val_frac=0.25, seed=42,
                     soundscape_weight=3.0):
     """
     Convenience function returning DataLoaders ready for training.

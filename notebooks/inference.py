@@ -21,6 +21,10 @@ import torch.nn as nn
 import soundfile as sf
 import librosa
 
+# ── CPU optimization ──────────────────────────────────────────────────────────
+torch.set_num_threads(4)  # Kaggle has 4 CPU cores
+torch.set_grad_enabled(False)
+
 # ── Paths ──────────────────────────────────────────────────────────────────────
 _INPUT = "/kaggle/input"
 
@@ -74,7 +78,7 @@ SEGMENT_SECONDS = 5
 CLIP_SECONDS = 10
 CLIP_SAMPLES = SAMPLE_RATE * CLIP_SECONDS
 SEGMENT_SAMPLES = SAMPLE_RATE * SEGMENT_SECONDS
-BATCH_SIZE = 16
+BATCH_SIZE = 8  # smaller batches for CPU memory efficiency
 
 # ── Stub out problematic imports before loading HTSAT code ─────────────────────
 for mod_name in ["h5py", "museval", "museval.metrics", "torchcontrib", "torchcontrib.optim"]:
@@ -153,11 +157,15 @@ def load_model(checkpoint_path):
 
 
 # Load all models for ensemble
+t_load = time.time()
 models = []
 for cp in CHECKPOINT_PATHS:
     print(f"Loading {os.path.basename(cp)} ...")
     models.append(load_model(cp))
-print(f"Loaded {len(models)} models for ensemble.")
+print(f"Loaded {len(models)} models for ensemble in {time.time() - t_load:.1f}s")
+
+# Pre-compute column index mapping once
+col_indices = np.array([col_to_model_idx[c] for c in sub_columns])
 
 
 # ── Audio helpers ──────────────────────────────────────────────────────────────
@@ -176,28 +184,29 @@ def load_audio(path):
     return audio.astype(np.float32)
 
 
-def pad_to_clip(segment):
-    """Pad a 5s segment to CLIP_SAMPLES (10s) by tiling."""
-    if len(segment) < CLIP_SAMPLES:
-        repeats = (CLIP_SAMPLES // max(len(segment), 1)) + 1
-        segment = np.tile(segment, repeats)[:CLIP_SAMPLES]
-    return segment[:CLIP_SAMPLES].astype(np.float32)
+def segment_audio(audio):
+    """Split audio into 5s segments, each padded/tiled to 10s."""
+    n_segments = len(audio) // SEGMENT_SAMPLES
+    if n_segments == 0:
+        return None
+    segments = np.empty((n_segments, CLIP_SAMPLES), dtype=np.float32)
+    for i in range(n_segments):
+        seg = audio[i * SEGMENT_SAMPLES : (i + 1) * SEGMENT_SAMPLES]
+        # Tile 5s to 10s
+        segments[i] = np.tile(seg, 2)[:CLIP_SAMPLES]
+    return segments
 
 
 # ── Inference ──────────────────────────────────────────────────────────────────
-@torch.no_grad()
 def predict_batch_ensemble(models, waveforms):
     """Run inference with all models and average predictions."""
-    x = torch.from_numpy(waveforms).float()
-    probs_sum = None
+    x = torch.from_numpy(waveforms)
+    probs_sum = np.zeros((len(waveforms), NUM_CLASSES), dtype=np.float32)
     for model in models:
         output_dict = model(x)
-        probs = output_dict["clipwise_output"].cpu().numpy()
-        if probs_sum is None:
-            probs_sum = probs
-        else:
-            probs_sum += probs
-    return probs_sum / len(models)
+        probs_sum += output_dict["clipwise_output"].numpy()
+    probs_sum /= len(models)
+    return probs_sum
 
 
 # ── Main loop ──────────────────────────────────────────────────────────────────
@@ -212,7 +221,8 @@ def main():
     )
     print(f"Found {len(test_files)} test soundscapes")
 
-    results = []
+    all_row_ids = []
+    all_probs = []
 
     for file_idx, filepath in enumerate(test_files):
         fname_stem = os.path.splitext(os.path.basename(filepath))[0]
@@ -223,48 +233,35 @@ def main():
             print(f"WARNING: Failed to load {filepath}: {e}")
             continue
 
-        duration_samples = len(audio)
-        n_segments = duration_samples // SEGMENT_SAMPLES
-        if n_segments == 0:
+        segments = segment_audio(audio)
+        if segments is None:
             continue
 
-        segments = []
-        row_ids = []
-        for i in range(n_segments):
-            start = i * SEGMENT_SAMPLES
-            end = start + SEGMENT_SAMPLES
-            seg = audio[start:end]
-            seg = pad_to_clip(seg)
-            segments.append(seg)
-            end_second = (i + 1) * SEGMENT_SECONDS
-            row_ids.append(f"{fname_stem}_{end_second}")
+        n_segments = len(segments)
+        row_ids = [f"{fname_stem}_{(i + 1) * SEGMENT_SECONDS}" for i in range(n_segments)]
 
-        segments = np.stack(segments, axis=0)
-        for batch_start in range(0, len(segments), BATCH_SIZE):
+        # Batch inference
+        for batch_start in range(0, n_segments, BATCH_SIZE):
             batch = segments[batch_start : batch_start + BATCH_SIZE]
             probs = predict_batch_ensemble(models, batch)
-            for j in range(len(probs)):
-                results.append((row_ids[batch_start + j], probs[j]))
+            # Reorder columns to match submission format
+            all_probs.append(probs[:, col_indices])
+            all_row_ids.extend(row_ids[batch_start : batch_start + len(batch)])
 
-        if (file_idx + 1) % 10 == 0:
+        if (file_idx + 1) % 50 == 0:
             elapsed = time.time() - t0
             print(f"  Processed {file_idx + 1}/{len(test_files)} files ({elapsed:.0f}s)")
 
     # ── Build submission ───────────────────────────────────────────────────────
-    print(f"Building submission with {len(results)} rows...")
+    print(f"Building submission with {len(all_row_ids)} rows...")
 
-    if len(results) == 0:
+    if len(all_row_ids) == 0:
         print("WARNING: No predictions generated. Using sample submission.")
         sub = pd.read_csv(SAMPLE_SUB_PATH)
     else:
-        row_ids = [r[0] for r in results]
-        probs_matrix = np.stack([r[1] for r in results], axis=0)
-
-        col_indices = [col_to_model_idx[c] for c in sub_columns]
-        probs_matrix = probs_matrix[:, col_indices]
-
+        probs_matrix = np.concatenate(all_probs, axis=0)
         sub = pd.DataFrame(probs_matrix, columns=sub_columns)
-        sub.insert(0, "row_id", row_ids)
+        sub.insert(0, "row_id", all_row_ids)
 
     sub.to_csv(OUTPUT_PATH, index=False)
     elapsed = time.time() - t0

@@ -237,7 +237,7 @@ def main():
     parser.add_argument("--max_epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--warmup_epochs", type=int, default=1)
-    parser.add_argument("--val_frac", type=float, default=0.15)
+    parser.add_argument("--val_frac", type=float, default=0.25)
     parser.add_argument("--save_dir", type=str,
                         default=os.path.join(PROJ_ROOT, "checkpoints"))
     parser.add_argument("--seed", type=int, default=42)
@@ -251,6 +251,8 @@ def main():
                         help="W&B project name")
     parser.add_argument("--run_name", type=str, default=None,
                         help="W&B run name (defaults to auto-generated)")
+    parser.add_argument("--run_id", type=str, default=None,
+                        help="Run ID for checkpoint subdir (defaults to seed<N>)")
     args = parser.parse_args()
 
     pl.seed_everything(args.seed)
@@ -299,17 +301,19 @@ def main():
         n_train_audio=n_train_audio,
     )
 
-    # Save each seed's checkpoints in a subdirectory
-    seed_save_dir = os.path.join(args.save_dir, f"seed{args.seed}")
-    os.makedirs(seed_save_dir, exist_ok=True)
+    # Save checkpoints in a run-specific subdirectory
+    run_id = args.run_id or f"seed{args.seed}"
+    run_save_dir = os.path.join(args.save_dir, run_id)
+    os.makedirs(run_save_dir, exist_ok=True)
+    logger.info(f"Checkpoints will be saved to: {run_save_dir}")
 
     # Callbacks
     ckpt_callback = ModelCheckpoint(
-        dirpath=seed_save_dir,
+        dirpath=run_save_dir,
         filename="birdclef-htsat-{epoch:02d}-{val_macro_auc:.4f}",
         monitor="val_macro_auc",
         mode="max",
-        save_top_k=3,
+        save_top_k=5,
     )
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
 

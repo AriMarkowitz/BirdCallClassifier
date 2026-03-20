@@ -6,29 +6,32 @@
 ```bash
 sbatch scripts/train.sh
 ```
-Trains one model with seed 42 on the Easley L40S partition. Checkpoints saved to `checkpoints/seed42/`. Logs appear in `logs/birdclef_<jobid>.out` and in Weights & Biases under project `birdclef-2026`.
+Trains one model with seed 42 on the Easley L40S partition. Checkpoints saved to `checkpoints/<jobid>/`. Logs appear in `logs/birdclef_<jobid>.log` and in Weights & Biases under project `birdclef-2026`.
 
 ### 5-model ensemble
 ```bash
 bash scripts/train_ensemble.sh
 ```
-Submits 5 independent SLURM jobs (seeds 42, 123, 456, 789, 2026). Each saves to its own subdirectory: `checkpoints/seed42/`, `checkpoints/seed123/`, etc. Jobs may run in parallel if GPUs are available.
+Submits 5 independent SLURM jobs (seeds 42, 123, 456, 789, 2026). Each gets a different 75/25 soundscape val split and saves to `checkpoints/<jobid>/`.
 
 ### Monitor training
 ```bash
 squeue -u $USER                        # check job status
-tail -f logs/birdclef_<jobid>.out      # live log output
+tail -f logs/birdclef_<jobid>.log      # live log output
 ```
 Or open Weights & Biases — run `wandb login` on the login node before submitting if you haven't already.
 
 ### Key hyperparameters (in `scripts/train.sh`)
 | Flag | Default | Notes |
 |---|---|---|
-| `--max_epochs` | 50 | |
-| `--lr` | 3e-5 | cosine restarts, floor 1e-6 |
+| `--max_epochs` | 40 | |
+| `--lr` | 1e-4 | constant LR |
 | `--batch_size` | 128 | uses ~24GB of 48GB VRAM |
-| `--soundscape_weight` | 3.0 | upweight soundscape segments |
-| `--val_sites` | S22 S23 | sites held out for validation |
+| `--soundscape_weight` | 3.0 | initial weight (curriculum ramps 0.5 → 5.0) |
+| `--val_frac` | 0.25 | fraction of soundscapes held out for val |
+
+### Curriculum training
+Soundscape weight ramps linearly from 0.5 (mostly clean audio) to 5.0 (heavy soundscape focus) over the training run. Progress is logged each epoch.
 
 ---
 
@@ -42,7 +45,7 @@ This expects Kaggle-style paths (`/kaggle/input/...`). For local testing you'd n
 
 ---
 
-## C) Uploading to Kaggle
+## C) Uploading & Submitting to Kaggle
 
 ### What lives in `kaggle_dataset/`
 This directory is the Kaggle dataset that gets uploaded. It contains:
@@ -51,45 +54,55 @@ This directory is the Kaggle dataset that gets uploaded. It contains:
 - `birdclef-htsat-*.ckpt` — trained checkpoint(s)
 - `dataset-metadata.json` — dataset ID (`arimarkowitz/birdclef-2026-model`)
 
-### Step 1 — Copy new checkpoint(s) in
-After training, copy the best checkpoint from each seed into `kaggle_dataset/`. For a single model:
+### One-command submit (recommended)
 ```bash
-cp checkpoints/seed42/birdclef-htsat-<epoch>-<auc>.ckpt kaggle_dataset/
+# Submit best checkpoint from specific training runs (picks highest val_macro_auc):
+bash scripts/submit.sh 309600_seed42 309601_seed123 309602_seed456
+
+# Submit whatever checkpoints are already in kaggle_dataset/:
+bash scripts/submit.sh
 ```
-For the ensemble, copy the best checkpoint from each seed:
+This handles the full pipeline: clears old checkpoints, copies best from each run, uploads dataset, pushes notebook, waits for completion, downloads output, and submits.
+
+### Manual step-by-step
+
+#### Step 1 — Copy new checkpoint(s) in
 ```bash
-for seed in 42 123 456 789 2026; do
-    best=$(ls -t checkpoints/seed${seed}/birdclef-htsat-*.ckpt 2>/dev/null | head -1)
-    [ -n "$best" ] && cp "$best" kaggle_dataset/
+rm kaggle_dataset/birdclef-htsat-*.ckpt  # clear old ones
+
+# Copy best from each run (replace <run_id> with e.g. 309600_seed42)
+for run_id in <run1> <run2> <run3>; do
+    best=$(ls checkpoints/${run_id}/birdclef-htsat-*.ckpt | sed 's/.*val_macro_auc[=_]\([0-9.]*\).*/\1 &/' | sort -rn | head -1 | cut -d' ' -f2)
+    cp "$best" kaggle_dataset/
 done
 ```
-Remove old checkpoints from `kaggle_dataset/` if you don't want them included (they bloat the upload and slow inference):
+
+#### Step 2 — Upload dataset (only when checkpoints change)
 ```bash
-ls kaggle_dataset/*.ckpt   # verify what's there before deleting
-rm kaggle_dataset/birdclef-htsat-<old-checkpoint>.ckpt
+kaggle datasets version -p kaggle_dataset/ -m "description of changes" --dir-mode zip
 ```
 
-### Step 2 — Upload dataset (only when checkpoints change)
+#### Step 3 — Run notebook and submit (CLI)
 ```bash
-kaggle datasets version -p kaggle_dataset/ -m "v2: ensemble 5 seeds" --dir-mode zip
+kaggle kernels push -p notebooks/                          # triggers fresh run
+kaggle kernels status arimarkowitz/birdclef-2026-inference  # check progress
+
+# Once status is "complete":
+kaggle kernels output arimarkowitz/birdclef-2026-inference -p /tmp/submission
+kaggle competitions submit -c birdclef-2026 -f /tmp/submission/submission.csv -m "description"
 ```
-This creates a **new version** of the existing dataset — it does **not** create a duplicate dataset. Skip this step if the checkpoints haven't changed since the last upload.
 
-### Step 3 — Push the inference notebook
-```bash
-kaggle kernels push -p notebooks/
-```
-This updates the notebook code. You only need to re-push when `notebooks/inference.py` changes.
+#### Step 3 (alternative) — Via Kaggle UI
+1. Open notebook on kaggle.com → click **Edit**
+2. **Save Version** → **Save & Run All (Commit)**
+3. Wait for run to complete
+4. Go to **Output** tab → **Submit to Competition**
 
-### Step 4 — Run the notebook and submit
-1. Go to [kaggle.com](https://www.kaggle.com) → your notebook → **Run All**
-2. Once complete, go to the **Output** tab → **Submit to Competition**
-
-### Avoiding redundant uploads
+### Avoiding redundant work
 | Changed | Action needed |
 |---|---|
-| Only `inference.py` | `kaggle kernels push` only |
+| Only `inference.py` | `kaggle kernels push` (triggers re-run) |
 | Only checkpoints | `kaggle datasets version` + `kaggle kernels push` |
-| Neither | Just re-run the existing notebook on Kaggle |
+| Neither | Just re-run: `kaggle kernels push` |
 
 The dataset version number increments each time you run `kaggle datasets version`. The notebook automatically uses the latest version of the attached dataset.

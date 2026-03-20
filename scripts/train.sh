@@ -70,18 +70,22 @@ fi
 SEED="${SEED:-42}"
 
 # ── Run training ──
+JOB_ID="${SLURM_JOB_ID:-local_$(date +%Y%m%d_%H%M%S)}"
+RUN_ID="${JOB_ID}_seed${SEED}"
+
 python src/train.py \
     --data_dir "$PROJECT_DIR/data" \
     --checkpoint "$CKPT_PATH" \
     --batch_size 128 \
     --num_workers 8 \
-    --max_epochs 50 \
+    --max_epochs 40 \
     --lr 1e-4 \
     --save_dir "$CKPT_DIR" \
     --seed "$SEED" \
     --soundscape_weight 3.0 \
     --use_wandb \
     --wandb_project birdclef-2026 \
-    --run_name "htsat-seed${SEED}"
+    --run_name "htsat-${RUN_ID}" \
+    --run_id "$RUN_ID"
 
-echo "Training complete (seed=$SEED)."
+echo "Training complete (run=$RUN_ID)."
