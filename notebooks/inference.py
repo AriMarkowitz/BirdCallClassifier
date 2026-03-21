@@ -2,6 +2,7 @@
 BirdCLEF 2026 — Kaggle Inference Notebook
 HTSAT-tiny fine-tuned on BirdCLEF 2026 training data.
 Supports multi-model ensemble (averages predictions across all checkpoints).
+Includes temporal MLP for time-of-day and seasonality awareness.
 
 Constraints: CPU-only, no internet, 90-minute limit.
 """
@@ -11,6 +12,8 @@ import os
 import types
 import glob
 import time
+import math
+import re
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -79,6 +82,7 @@ CLIP_SECONDS = 10
 CLIP_SAMPLES = SAMPLE_RATE * CLIP_SECONDS
 SEGMENT_SAMPLES = SAMPLE_RATE * SEGMENT_SECONDS
 BATCH_SIZE = 8  # smaller batches for CPU memory efficiency
+TEMPORAL_DIM = 4
 
 # ── Stub out problematic imports before loading HTSAT code ─────────────────────
 for mod_name in ["h5py", "museval", "museval.metrics", "torchcontrib", "torchcontrib.optim"]:
@@ -111,6 +115,54 @@ htsat_config.htsat_attn_heatmap = False
 htsat_config.enable_repeat_mode = False
 
 
+# ── Temporal features ─────────────────────────────────────────────────────────
+def parse_temporal_features(filename):
+    """Extract cyclical temporal features from soundscape filename.
+
+    Filename format: BC2026_Test_0001_S05_20250227_010002.ogg
+                                          YYYYMMDD  HHMMSS
+
+    Returns np.float32 array of shape (4,):
+        [sin(2π·hour/24), cos(2π·hour/24), sin(2π·doy/365), cos(2π·doy/365)]
+    """
+    m = re.search(r'_(\d{8})_(\d{6})', filename)
+    if m is None:
+        return np.zeros(TEMPORAL_DIM, dtype=np.float32)
+
+    date_str, time_str = m.group(1), m.group(2)
+    hour = int(time_str[:2]) + int(time_str[2:4]) / 60.0
+
+    year = int(date_str[:4])
+    month = int(date_str[4:6])
+    day = int(date_str[6:8])
+    from datetime import date
+    doy = date(year, month, day).timetuple().tm_yday
+
+    hour_rad = 2.0 * math.pi * hour / 24.0
+    doy_rad = 2.0 * math.pi * doy / 365.0
+
+    return np.array([
+        math.sin(hour_rad), math.cos(hour_rad),
+        math.sin(doy_rad), math.cos(doy_rad),
+    ], dtype=np.float32)
+
+
+class TemporalMLP(nn.Module):
+    """Small MLP that maps cyclical temporal features to a per-class logit bias."""
+
+    def __init__(self, temporal_dim, num_classes, hidden_dim=128, dropout=0.3):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(temporal_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_classes),
+        )
+
+    def forward(self, temporal_features):
+        return self.mlp(temporal_features)
+
+
 # ── Label map ──────────────────────────────────────────────────────────────────
 def build_label_map(taxonomy_path):
     df = pd.read_csv(taxonomy_path)
@@ -136,6 +188,7 @@ col_to_model_idx = {lbl: label_map[lbl] for lbl in sub_columns}
 
 # ── Load model ─────────────────────────────────────────────────────────────────
 def load_model(checkpoint_path):
+    """Load HTSAT model and temporal MLP from checkpoint."""
     model = HTSAT_Swin_Transformer(
         spec_size=htsat_config.htsat_spec_size,
         patch_size=htsat_config.htsat_patch_size,
@@ -148,20 +201,41 @@ def load_model(checkpoint_path):
         config=htsat_config,
     )
 
+    temporal_mlp = TemporalMLP(TEMPORAL_DIM, NUM_CLASSES)
+
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state_dict = ckpt["state_dict"]
-    state_dict = {k.replace("sed_model.", ""): v for k, v in state_dict.items()}
-    model.load_state_dict(state_dict, strict=True)
+
+    # Load HTSAT weights (strip sed_model. prefix)
+    htsat_dict = {k.replace("sed_model.", ""): v
+                  for k, v in state_dict.items()
+                  if k.startswith("sed_model.")}
+    model.load_state_dict(htsat_dict, strict=True)
     model.eval()
-    return model
+
+    # Load temporal MLP weights if present
+    temporal_dict = {k.replace("temporal_mlp.", ""): v
+                     for k, v in state_dict.items()
+                     if k.startswith("temporal_mlp.")}
+    if temporal_dict:
+        temporal_mlp.load_state_dict(temporal_dict, strict=True)
+        print(f"  Loaded temporal MLP from checkpoint")
+    else:
+        print(f"  No temporal MLP in checkpoint (using zero-init)")
+    temporal_mlp.eval()
+
+    return model, temporal_mlp
 
 
 # Load all models for ensemble
 t_load = time.time()
 models = []
+temporal_mlps = []
 for cp in CHECKPOINT_PATHS:
     print(f"Loading {os.path.basename(cp)} ...")
-    models.append(load_model(cp))
+    m, t = load_model(cp)
+    models.append(m)
+    temporal_mlps.append(t)
 print(f"Loaded {len(models)} models for ensemble in {time.time() - t_load:.1f}s")
 
 # Pre-compute column index mapping once
@@ -199,14 +273,27 @@ def segment_audio(audio):
 
 
 # ── Inference ──────────────────────────────────────────────────────────────────
-def predict_batch_ensemble(models, waveforms):
-    """Run inference with all models and average predictions."""
+def predict_batch_ensemble(models, temporal_mlps, waveforms, temporal_features):
+    """Run inference with all models and average predictions.
+
+    Applies temporal MLP bias in logit space before averaging.
+    """
     x = torch.from_numpy(waveforms)
+    t = torch.from_numpy(temporal_features)  # (batch, 4)
     batch_size = len(waveforms)
     probs_sum = np.zeros((batch_size, NUM_CLASSES), dtype=np.float32)
-    for model in models:
+    eps = 1e-6
+
+    for model, temp_mlp in zip(models, temporal_mlps):
         output_dict = model(x)
-        probs_sum += output_dict["clipwise_output"].numpy()
+        clipwise = output_dict["clipwise_output"]  # sigmoided
+
+        # Apply temporal bias in logit space
+        logits = torch.log(clipwise.clamp(eps, 1 - eps) / (1 - clipwise.clamp(eps, 1 - eps)))
+        temporal_bias = temp_mlp(t)
+        probs = torch.sigmoid(logits + temporal_bias)
+
+        probs_sum += probs.numpy()
     probs_sum /= len(models)
     return probs_sum
 
@@ -227,7 +314,11 @@ def main():
     all_probs = []
 
     for file_idx, filepath in enumerate(test_files):
-        fname_stem = os.path.splitext(os.path.basename(filepath))[0]
+        fname = os.path.basename(filepath)
+        fname_stem = os.path.splitext(fname)[0]
+
+        # Parse temporal features once per file (same for all segments)
+        temporal = parse_temporal_features(fname)
 
         try:
             audio = load_audio(filepath)
@@ -245,7 +336,9 @@ def main():
         # Batch inference
         for batch_start in range(0, n_segments, BATCH_SIZE):
             batch = segments[batch_start : batch_start + BATCH_SIZE]
-            probs = predict_batch_ensemble(models, batch)
+            # Broadcast temporal features to batch size
+            batch_temporal = np.tile(temporal, (len(batch), 1))
+            probs = predict_batch_ensemble(models, temporal_mlps, batch, batch_temporal)
             # Reorder columns to match submission format
             all_probs.append(probs[:, col_indices])
             all_row_ids.extend(row_ids[batch_start : batch_start + len(batch)])

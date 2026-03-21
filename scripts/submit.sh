@@ -81,14 +81,16 @@ echo "=== Step 3: Pushing notebook (triggers run) ==="
 kaggle kernels push -p "$NOTEBOOK_DIR"
 echo ""
 
-# Wait for notebook to complete
+# Wait for notebook to complete and capture version number
 echo "Waiting for notebook to complete..."
+NOTEBOOK_COMPLETE=false
 for i in $(seq 1 60); do
     sleep 30
     STATUS=$(kaggle kernels status "$KERNEL_SLUG" 2>&1)
     echo "  [$i] $STATUS"
     if echo "$STATUS" | grep -qi "complete"; then
         echo "Notebook finished successfully."
+        NOTEBOOK_COMPLETE=true
         break
     fi
     if echo "$STATUS" | grep -qi "error\|cancel"; then
@@ -96,21 +98,35 @@ for i in $(seq 1 60); do
         exit 1
     fi
 done
+
+if [ "$NOTEBOOK_COMPLETE" != "true" ]; then
+    echo "ERROR: Notebook did not complete within 30 minutes."
+    exit 1
+fi
+
+# Get the latest version number
+VERSION=$(kaggle kernels list --mine --search "birdclef-2026-inference" --csv 2>/dev/null \
+    | grep "birdclef-2026-inference" | head -1 | cut -d',' -f5)
+if [ -z "$VERSION" ]; then
+    VERSION=1
+    echo "WARNING: Could not detect version number, defaulting to $VERSION"
+fi
+echo "Notebook version: $VERSION"
 echo ""
 
 # ── Step 4: Submit to competition ─────────────────────────────────────────────
-# For code competitions, the notebook IS the submission — Kaggle re-runs it
-# against the hidden test set. We can't submit the CSV directly.
 echo "=== Step 4: Submitting notebook to competition ==="
+SUBMIT_MSG="Ensemble: ${CKPT_COUNT} checkpoints"
+if [ $# -gt 0 ]; then
+    SUBMIT_MSG="$SUBMIT_MSG ($*)"
+fi
+
+kaggle competitions submit \
+    -c "$COMPETITION" \
+    -f submission.csv \
+    -k "$KERNEL_SLUG" \
+    -v "$VERSION" \
+    -m "$SUBMIT_MSG"
+
 echo ""
-echo "Notebook ran successfully. Now submit it to the competition:"
-echo ""
-echo "  1. Go to: https://www.kaggle.com/code/arimarkowitz/birdclef-2026-inference"
-echo "  2. Click the latest version under 'Output'"
-echo "  3. Click 'Submit to Competition'"
-echo ""
-echo "Or re-run via the Kaggle UI:"
-echo "  1. Open notebook → Edit → Save Version → Save & Run All"
-echo "  2. After completion → Output → Submit to Competition"
-echo ""
-echo "=== Done! ==="
+echo "=== Done! Submission sent to $COMPETITION ==="

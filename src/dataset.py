@@ -5,12 +5,15 @@ Two dataset classes:
   - TrainAudioDataset:      individual species clips from train_audio/
   - SoundscapeDataset:      5-second segments from train_soundscapes/
 
-Both return {"waveform": np.float32 (clip_samples,), "target": np.float32 (num_classes,)}
-which matches the HTSAT SEDWrapper training interface.
+Both return {"waveform": np.float32 (clip_samples,), "target": np.float32 (num_classes,),
+             "temporal": np.float32 (4,)}
+where temporal = [sin(hour), cos(hour), sin(doy), cos(doy)] cyclical encoding.
+TrainAudioDataset returns zeros (no temporal metadata available).
 """
 
 import os
 import re
+import math
 import numpy as np
 import pandas as pd
 import soundfile as sf
@@ -20,6 +23,8 @@ import torch
 import logging
 
 logger = logging.getLogger(__name__)
+
+TEMPORAL_DIM = 4  # sin(hour), cos(hour), sin(doy), cos(doy)
 
 
 def build_label_map(taxonomy_path):
@@ -33,6 +38,37 @@ def _parse_site_id(filename):
     """Extract site ID (e.g. 'S08') from soundscape filename like BC2026_Train_0001_S08_..."""
     m = re.search(r'_S(\d+)_', filename)
     return f"S{m.group(1)}" if m else None
+
+
+def _parse_temporal_features(filename):
+    """Extract cyclical temporal features from soundscape filename.
+
+    Filename format: BC2026_Train_0039_S22_20211231_201500.ogg
+                                          YYYYMMDD  HHMMSS
+
+    Returns np.float32 array of shape (4,):
+        [sin(2π·hour/24), cos(2π·hour/24), sin(2π·doy/365), cos(2π·doy/365)]
+    """
+    m = re.search(r'_(\d{8})_(\d{6})', filename)
+    if m is None:
+        return np.zeros(TEMPORAL_DIM, dtype=np.float32)
+
+    date_str, time_str = m.group(1), m.group(2)
+    hour = int(time_str[:2]) + int(time_str[2:4]) / 60.0
+
+    year = int(date_str[:4])
+    month = int(date_str[4:6])
+    day = int(date_str[6:8])
+    from datetime import date
+    doy = date(year, month, day).timetuple().tm_yday
+
+    hour_rad = 2.0 * math.pi * hour / 24.0
+    doy_rad = 2.0 * math.pi * doy / 365.0
+
+    return np.array([
+        math.sin(hour_rad), math.cos(hour_rad),
+        math.sin(doy_rad), math.cos(doy_rad),
+    ], dtype=np.float32)
 
 
 class TrainAudioDataset(Dataset):
@@ -83,7 +119,11 @@ class TrainAudioDataset(Dataset):
         target[self.label_map[self.labels[index]]] = 1.0 - eps
         for idx in self.secondary_labels[index]:
             target[idx] = 1.0 - eps
-        return {"waveform": waveform, "target": target}
+        return {
+            "waveform": waveform,
+            "target": target,
+            "temporal": np.zeros(TEMPORAL_DIM, dtype=np.float32),
+        }
 
     def _load_audio(self, path):
         """Load, resample to mono, pad or randomly crop to clip_samples."""
@@ -152,6 +192,7 @@ class SoundscapeDataset(Dataset):
                 "end_sample": end_sec * sample_rate,
                 "label_indices": label_indices,
                 "site_id": _parse_site_id(filename),
+                "temporal": _parse_temporal_features(filename),
             })
 
     def __len__(self):
@@ -185,7 +226,11 @@ class SoundscapeDataset(Dataset):
         for idx in entry["label_indices"]:
             target[idx] = 1.0 - eps
 
-        return {"waveform": audio, "target": target}
+        return {
+            "waveform": audio,
+            "target": target,
+            "temporal": entry["temporal"],
+        }
 
 
 def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
