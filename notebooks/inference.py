@@ -44,7 +44,11 @@ for p in [f"{_INPUT}/birdclef-2026-model",
 assert COMPETITION_DATA, f"Competition data not found. /kaggle/input contains: {os.listdir(_INPUT)}"
 assert MODEL_DATASET, f"Model dataset not found. /kaggle/input contains: {os.listdir(_INPUT)}"
 
-CHECKPOINT_PATHS = sorted(glob.glob(os.path.join(MODEL_DATASET, "birdclef-birdmae-*.ckpt")))
+checkpoint_patterns = [
+    os.path.join(MODEL_DATASET, "birdclef-birdmae-*.ckpt"),
+    os.path.join(MODEL_DATASET, "*birdmae*.ckpt"),
+]
+CHECKPOINT_PATHS = sorted({cp for pattern in checkpoint_patterns for cp in glob.glob(pattern)})
 BIRD_MAE_CODE = os.path.join(MODEL_DATASET, "bird_mae")
 TAXONOMY_PATH = os.path.join(COMPETITION_DATA, "taxonomy.csv")
 
@@ -55,6 +59,7 @@ for cp in CHECKPOINT_PATHS:
     print(f"  - {os.path.basename(cp)}")
 
 assert len(CHECKPOINT_PATHS) > 0, "No checkpoints found"
+assert os.path.isdir(BIRD_MAE_CODE), "bird_mae code directory missing in model dataset"
 
 TEST_SOUNDSCAPES = os.path.join(COMPETITION_DATA, "test_soundscapes")
 SAMPLE_SUB_PATH = os.path.join(COMPETITION_DATA, "sample_submission.csv")
@@ -158,10 +163,11 @@ def predict_batch_ensemble(models, waveforms):
     batch_size = len(waveforms)
     logits_sum = np.zeros((batch_size, NUM_CLASSES), dtype=np.float32)
 
-    for backbone, head in models:
-        embeddings = backbone(mel)
-        logits = head(embeddings)
-        logits_sum += logits.numpy()
+    with torch.no_grad():
+        for backbone, head in models:
+            embeddings = backbone(mel)
+            logits = head(embeddings)
+            logits_sum += logits.detach().cpu().numpy()
 
     logits_avg = logits_sum / len(models)
     probs = torch.sigmoid(torch.from_numpy(logits_avg)).numpy()

@@ -4,15 +4,17 @@
 
 ### Single model
 ```bash
-sbatch scripts/train.sh
+sbatch scripts/train_birdmae.sh
 ```
-Trains one model with seed 42 on the Easley L40S partition. Checkpoints saved to `checkpoints/<jobid>/`. Logs appear in `logs/birdclef_<jobid>.log` and in Weights & Biases under project `birdclef-2026`.
+Trains one Bird-MAE model on fold 0 with seed 42. Checkpoints save under `checkpoints/<jobid>_mae_fold0/`. Logs appear in `logs/birdclef_<jobid>.log` and in Weights & Biases under project `birdclef-2026`.
 
 ### 5-model ensemble
 ```bash
-bash scripts/train_ensemble.sh
+for fold in 0 1 2 3 4; do
+    FOLD=$fold sbatch scripts/train_birdmae.sh
+done
 ```
-Submits 5 independent SLURM jobs (seeds 42, 123, 456, 789, 2026). Each gets a different 75/25 soundscape val split and saves to `checkpoints/<jobid>/`.
+Submits 5 independent SLURM jobs, one per fold, for a fold ensemble. Each run saves to `checkpoints/<jobid>_mae_fold<fold>/`.
 
 ### Monitor training
 ```bash
@@ -21,17 +23,18 @@ tail -f logs/birdclef_<jobid>.log      # live log output
 ```
 Or open Weights & Biases — run `wandb login` on the login node before submitting if you haven't already.
 
-### Key hyperparameters (in `scripts/train.sh`)
+### Key hyperparameters (in `scripts/train_birdmae.sh`)
 | Flag | Default | Notes |
 |---|---|---|
 | `--max_epochs` | 40 | |
 | `--lr` | 1e-4 | constant LR |
-| `--batch_size` | 128 | uses ~24GB of 48GB VRAM |
-| `--soundscape_weight` | 3.0 | initial weight (curriculum ramps 0.5 → 5.0) |
-| `--val_frac` | 0.25 | fraction of soundscapes held out for val |
+| `--batch_size` | 64 | |
+| `--soundscape_weight` | 3.0 | curriculum ramps 0.5 → 3.0 |
+| `--n_folds` | 5 | k-fold split of soundscape segments |
+| `--fold` | 0 | held-out validation fold |
 
 ### Curriculum training
-Soundscape weight ramps linearly from 0.5 (mostly clean audio) to 5.0 (heavy soundscape focus) over the training run. Progress is logged each epoch.
+Soundscape weight ramps linearly from 0.5 (mostly clean audio) to 3.0 (higher soundscape focus) over the training run. Progress is logged each epoch.
 
 ---
 
@@ -49,9 +52,9 @@ This expects Kaggle-style paths (`/kaggle/input/...`). For local testing you'd n
 
 ### What lives in `kaggle_dataset/`
 This directory is the Kaggle dataset that gets uploaded. It contains:
-- `htsat/` — vendored HTSAT model code
+- `bird_mae/` — vendored Bird-MAE model code
 - `taxonomy.csv` — class label map
-- `birdclef-htsat-*.ckpt` — trained checkpoint(s)
+- `birdclef-birdmae-*.ckpt` — trained checkpoint(s)
 - `dataset-metadata.json` — dataset ID (`arimarkowitz/birdclef-2026-model`)
 
 ### One-command submit (recommended)
@@ -68,11 +71,11 @@ This handles the full pipeline: clears old checkpoints, copies best from each ru
 
 #### Step 1 — Copy new checkpoint(s) in
 ```bash
-rm kaggle_dataset/birdclef-htsat-*.ckpt  # clear old ones
+rm kaggle_dataset/birdclef-birdmae-*.ckpt  # clear old ones
 
 # Copy best from each run (replace <run_id> with e.g. 309600_seed42)
 for run_id in <run1> <run2> <run3>; do
-    best=$(ls checkpoints/${run_id}/birdclef-htsat-*.ckpt | sed 's/.*val_macro_auc[=_]\([0-9.]*\).*/\1 &/' | sort -rn | head -1 | cut -d' ' -f2)
+    best=$(ls checkpoints/${run_id}/birdclef-birdmae-*.ckpt | sed 's/.*val_macro_auc[=_]\([0-9.]*\).*/\1 &/' | sort -rn | head -1 | cut -d' ' -f2)
     cp "$best" kaggle_dataset/
 done
 ```
