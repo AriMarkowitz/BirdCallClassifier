@@ -4,48 +4,65 @@
 - [x] Site-based validation split — no data leakage
 - [x] WeightedRandomSampler upweighting soundscape data
 - [x] Wandb logging (train_loss, val_loss, val_macro_auc)
-- [x] 5-model ensemble with k-fold cross-validation
+- [x] 4-model ensemble with k-fold cross-validation
 - [x] Curriculum training (soundscape weight ramps 1.0 → 3.0)
 - [x] Secondary labels in train_audio (multi-hot targets)
 - [x] Label smoothing (ε=0.1)
 - [x] All taxonomy classes trained (birds, insects, amphibians, mammals, reptiles)
+- [x] Two-stage temporal fusion (implemented but made Kaggle score worse — temporal MLP overfits on 1183 soundscape samples, deprioritized)
 
-## Ranked ideas (best → worst)
-
-### Tier 1 — High impact, low risk
-1. **Audio augmentation** — mixup, Gaussian noise, SpecAugment (frequency/time masking). Soundscapes are noisy; augmenting clean train_audio to be more soundscape-like should reduce domain gap. This is likely the biggest remaining gap between val AUC (0.999) and Kaggle score (0.848).
-2. **Two-stage temporal fusion** — see detailed plan below. Injects time-of-day and seasonality metadata via a two-stage training approach. Well-designed to avoid the data-asymmetry problem that killed spatial embeddings.
-3. **Focal loss** instead of BCELoss — down-weights easy negatives (230+ absent species per segment), focuses gradients on hard cases. Easy to implement, drop-in replacement.
-
-### Tier 2 — High potential, more effort
-4. **Pseudo-labeling unlabeled soundscapes** — only a subset of train_soundscapes are labeled. Use current model to pseudo-label the rest, add high-confidence predictions to training set. Would massively increase training data for soundscape-only species (insect sonotypes, etc.).
-5. **Bird-MAE-Base as backbone replacement** — self-supervised ViT-B/16 (85M params, 768-dim embeddings) pretrained via masked autoencoder on BirdSet ([model](https://huggingface.co/DBD-research-group/Bird-MAE-Base)). Bird-specific representations should outperform AudioSet-general HTSAT features. Larger refactor — new spectrogram pipeline, model loading, inference notebook. ~2.5x larger than HTSAT-tiny so need to verify Kaggle inference timing. Must bundle custom model code in dataset upload (`trust_remote_code=True`). **Suggested first step**: freeze Bird-MAE, train linear probe on soundscape val set, compare AUC to current HTSAT. Prototype on a separate git branch.
-6. **BirdSet XCM as extra pretraining data** — 89k focal recordings, 409 species, 89GB. Fine-tune HTSAT on XCM first (stage 0), then continue with BirdCLEF fine-tuning (stage 1). Stays within current architecture. Need to check species overlap with our 234 BirdCLEF classes.
-
-### Tier 3 — Quick wins / incremental
-7. **Threshold tuning** — optimize per-class thresholds on validation set instead of using raw probabilities. Quick to implement, no retraining.
-8. **Spatial/site post-processing priors** — build species×location co-occurrence from train.csv, downweight predictions for species never observed near the Pantanal. No retraining needed. Site-specific priors from labeled soundscapes could also help.
-9. **Test-time augmentation (TTA)** — average predictions over original + time-shifted versions of each 5s segment. Free accuracy but tight on Kaggle's 90-min CPU inference budget.
-10. **Cross-validation ensemble with hyperparameter diversity** — vary label smoothing, augmentation strength, or learning rate across folds for more diverse ensemble members. Diminishing returns over current uniform ensemble.
-
-### Tier 4 — Blocked or speculative
-11. **Larger HTSAT model** — HTSAT-base (htsat_dim=128, depths=[2,2,12,2]) if training budget allows. More compute for marginal gain.
-12. **Google Perch v2 (EfficientNet-B3, 12M params)** — Google Research bioacoustics model, ~15k species, 1536-dim embeddings ([model](https://huggingface.co/cgeorgiaw/Perch)). State-of-the-art on benchmarks but **blocked**: TensorFlow-only, GPU-only (no CPU variant yet), no Kaggle offline install. Worth revisiting if a PyTorch port or ONNX export becomes available.
-13. **AudioProtoPNet (ConvNeXt-base, 0.3B params)** — BirdSet XCL trained ([model](https://huggingface.co/DBD-research-group/AudioProtoPNet-20-BirdSet-XCL)). Too large for Kaggle CPU inference. Lower priority unless distilled.
-14. **Knowledge distillation** from a larger teacher model — speculative, no clear teacher available yet.
-15. **Multi-scale inference** — process segments at multiple window sizes (3s, 5s, 10s). Experimental, adds inference cost.
+## Key problem: domain shift
+Val AUC is 0.999 but Kaggle score is 0.848. The model memorizes clean focal recordings from train_audio but cannot generalize to noisy, polyphonic test soundscapes. Past BirdCLEF winners confirm this is THE problem to solve. Everything below is ordered by expected impact on closing this gap.
 
 ---
 
-## Two-stage temporal fusion (detailed plan)
-Two-stage training to inject temporal metadata (time-of-day, seasonality) into predictions. The architecture includes temporal embedding inputs from the start, but trains them in two phases to handle the data asymmetry (train_audio lacks date/time, soundscapes have it).
+## Tier 1 — Proven winning strategies (from past BirdCLEF solutions)
 
-- [ ] **Stage 1: Full model with zeroed temporal inputs** — fine-tune HTSAT backbone + classification head + temporal MLP together on all data (train_audio + soundscapes). Temporal features are set to zeros for all samples. The model learns audio classification while the temporal pathway learns to be a no-op. This means the head is jointly trained with the backbone from the start, avoiding distribution shift when temporal features are introduced later.
-- [ ] **Stage 2: Train temporal MLP on real features** — freeze HTSAT backbone, unfreeze temporal MLP only, train on soundscape data only (where real temporal metadata is available). The MLP learns to modulate predictions based on time-of-day and seasonality. Since the head already works well with zero temporal input, stage 2 only needs to learn the temporal delta.
-  - **Temporal features** (4-dim): `[sin(2π·hour/24), cos(2π·hour/24), sin(2π·doy/365), cos(2π·doy/365)]` parsed from soundscape filenames (e.g. `_20211231_201500` → Dec 31, 20:15 UTC).
-  - **Architecture**: temporal MLP maps 4-dim → embed_dim, added to HTSAT audio embeddings before the classification head. Only the temporal MLP is trained in stage 2; backbone + head weights stay frozen.
-  - **Training data**: soundscape segments only (these have temporal metadata). Same k-fold split as stage 1 for consistent validation.
-  - **Inference**: parse date/time from test soundscape filenames, run HTSAT + temporal MLP. Adds negligible inference cost — should not hit the 90-minute Kaggle time limit even with ensemble.
-  - **Considerations**: keep the MLP small to avoid overfitting on the limited soundscape training data. Regularize (dropout, weight decay). Monitor whether temporal features actually improve val AUC vs stage 1 alone.
+### 1. Noise-robust training with strong augmentation
+The model trains on clean single-species focal recordings but tests on noisy multi-species soundscapes. Augmentation bridges this domain gap.
 
-Any backbone replacement (Bird-MAE, Perch, etc.) should be prototyped on a separate git branch to avoid disrupting the current HTSAT pipeline.
+- [ ] **Multi-species mixing** — randomly overlay 3-5 train_audio clips at varying volumes per sample. Union their multi-hot labels. Teaches the model to detect individual species in polyphonic audio. This is the competition-specific version of MixUp that past winners used.
+- [ ] **Soundscape background injection** — mix a random crop from the 10,593 unlabeled soundscape files as background noise behind clean train_audio clips. This is the most realistic noise source possible — same equipment, same sites, same ambient conditions as test data. ~5GB of free noise available in `data/train_soundscapes/`.
+- [ ] **SpecAugment (aggressive)** — increase frequency/time masking beyond current defaults. Force model to be robust to partial information.
+- [ ] **Gaussian noise / gain variation** — random SNR noise injection and volume scaling for additional robustness.
+
+### 2. Iterative pseudo-labeling of unlabeled soundscapes
+Only 66 of 10,658 soundscape files have labels (1,478 segments). The other 10,593 files are unlabeled — this is a massive untapped resource. Past winners treated this as the #1 lever.
+
+- [ ] **Round 1: Generate pseudo-labels** — run current best model on all unlabeled soundscapes, segment into 5s windows, predict species probabilities. Filter by confidence threshold (e.g. keep predictions > 0.8).
+- [ ] **Round 2: Retrain with pseudo-labels** — add high-confidence pseudo-labeled segments to training set. Use soft labels (raw probabilities) instead of hard labels to reduce noise propagation.
+- [ ] **Round 3+: Iterate** — retrain → relabel → retrain. Each round improves the model's soundscape predictions, producing better pseudo-labels for the next round. Typically 2-3 rounds before diminishing returns.
+- [ ] **Pseudo-label filtering** — track prediction confidence across rounds. Remove samples where the model flip-flops (unstable predictions). Weight pseudo-labeled samples lower than ground-truth labeled samples in the loss.
+
+### 3. Focal loss
+- [ ] **Replace BCELoss with focal loss** — down-weights easy negatives (230+ absent species per segment), focuses gradients on hard positives. Complements pseudo-labeling since pseudo-labels are noisier than ground truth. Drop-in replacement, α=0.25, γ=2.0 as starting point.
+
+### 4. Bird-MAE-Base backbone replacement
+- [ ] **Replace HTSAT with Bird-MAE-Base** — self-supervised ViT-B/16 (85M params, 768-dim embeddings) pretrained via masked autoencoder on BirdSet's 9.7k species ([model](https://huggingface.co/DBD-research-group/Bird-MAE-Base)). Bird-specific representations should outperform AudioSet-general HTSAT for fine-grained species discrimination. Requires new spectrogram pipeline (HuggingFace feature extractor), new model wrapper, new inference notebook. Must bundle custom model code in Kaggle dataset upload (`trust_remote_code=True`). **Prototype on separate branch.** ~2.5x larger than HTSAT-tiny — need to verify it fits in Kaggle's 90-min CPU inference window.
+
+---
+
+## Tier 2 — High potential, more effort
+
+### 5. Longer-context SED-style training
+- [ ] **Train on longer windows** — instead of 10s clips, train on 30-60s windows with frame-level (SED) predictions. Past winners found that longer context helps the model learn temporal patterns of species calls within a soundscape. Requires adjusting the HTSAT input size or using a sliding window with aggregation.
+
+### 6. Transfer learning from larger bird-audio sources
+- [ ] **BirdSet XCM pretraining (stage 0)** — 89k focal recordings, 409 species, 89GB. Fine-tune backbone on XCM first, then on BirdCLEF data. Stays within current architecture. Need to check species overlap with our 234 classes.
+- [ ] **BirdSet XCL (full dataset)** — 528k recordings, 9.7k species, 484GB. Maximum pretraining data but significant storage/compute requirements.
+
+### 7. Post-processing
+- [ ] **Threshold tuning** — optimize per-class thresholds on validation set instead of using 0.5 cutoff. Quick win, no retraining.
+- [ ] **Spatial/site priors** — build species×location co-occurrence from train.csv, downweight predictions for species never observed near the Pantanal. No retraining needed.
+- [ ] **Test-time augmentation (TTA)** — average predictions over original + time-shifted segments. Free accuracy but tight on inference budget.
+
+---
+
+## Tier 3 — Deprioritized / blocked
+
+- [ ] **Two-stage temporal fusion** — implemented, made score worse. Temporal MLP overfits on small soundscape training set. May revisit after pseudo-labeling massively increases soundscape training data.
+- [ ] **Cross-validation ensemble diversity** — vary hyperparameters across folds. Diminishing returns.
+- [ ] **Google Perch v2** — blocked by TensorFlow-only, GPU-only. Worth revisiting if PyTorch port appears.
+- [ ] **AudioProtoPNet** — 0.3B params, too large for Kaggle CPU inference.
+- [ ] **Knowledge distillation** — no clear teacher model yet.
+- [ ] **Multi-scale inference** — experimental, adds inference cost.

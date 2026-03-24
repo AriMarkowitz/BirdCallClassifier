@@ -4,7 +4,8 @@
 #
 # Usage:
 #   bash scripts/submit.sh                          # uses all checkpoints in kaggle_dataset/
-#   bash scripts/submit.sh 309600_seed42 309601_seed123   # pick specific runs
+#   bash scripts/submit.sh 309600_seed42 309601_seed123   # pick best checkpoint per run
+#   USE_LATEST=1 bash scripts/submit.sh 309600_seed42     # pick most recent checkpoint per run
 #
 # Requirements: kaggle CLI configured (kaggle.json or ~/.kaggle/kaggle.json)
 
@@ -15,9 +16,15 @@ KAGGLE_DS="$PROJECT_DIR/kaggle_dataset"
 NOTEBOOK_DIR="$PROJECT_DIR/notebooks"
 KERNEL_SLUG="arimarkowitz/birdclef-2026-inference"
 COMPETITION="birdclef-2026"
+USE_LATEST="${USE_LATEST:-0}"
 
 # ── Step 1: Copy checkpoints ──────────────────────────────────────────────────
 echo "=== Step 1: Preparing checkpoints ==="
+if [ "$USE_LATEST" = "1" ]; then
+    echo "Mode: most recent checkpoint per run"
+else
+    echo "Mode: best val_macro_auc checkpoint per run"
+fi
 
 # Clear old checkpoints
 rm -f "$KAGGLE_DS"/birdclef-htsat-*.ckpt
@@ -25,20 +32,33 @@ echo "Cleared old checkpoints from kaggle_dataset/"
 
 if [ $# -gt 0 ]; then
     # Specific run IDs provided as arguments
+    FOLD_IDX=0
     for run_id in "$@"; do
         run_dir="$PROJECT_DIR/checkpoints/$run_id"
         if [ ! -d "$run_dir" ]; then
             echo "ERROR: $run_dir not found"
             exit 1
         fi
-        # Pick checkpoint with highest val_macro_auc from filename
-        best=$(ls "$run_dir"/birdclef-htsat-*.ckpt 2>/dev/null | sed 's/.*val_macro_auc[=_]\([0-9.]*\).*/\1 &/' | sort -rn | head -1 | cut -d' ' -f2)
-        if [ -z "$best" ]; then
+
+        if [ "$USE_LATEST" = "1" ]; then
+            # Pick most recently modified checkpoint
+            picked=$(ls -t "$run_dir"/birdclef-htsat-*.ckpt 2>/dev/null | head -1)
+        else
+            # Pick checkpoint with highest val_macro_auc from filename
+            picked=$(ls "$run_dir"/birdclef-htsat-*.ckpt 2>/dev/null | sed 's/.*val_macro_auc[=_]\([0-9.]*\).*/\1 &/' | sort -rn | head -1 | cut -d' ' -f2)
+        fi
+
+        if [ -z "$picked" ]; then
             echo "ERROR: No checkpoints in $run_dir"
             exit 1
         fi
-        cp "$best" "$KAGGLE_DS/"
-        echo "  Copied: $(basename "$best") (from $run_id)"
+        # Use unique name per fold to avoid overwrites when filenames collide
+        ext="${picked##*.}"
+        base="$(basename "$picked" ".$ext")"
+        dest="$KAGGLE_DS/${base}_fold${FOLD_IDX}.${ext}"
+        cp "$picked" "$dest"
+        echo "  Copied: $(basename "$dest") (from $run_id)"
+        FOLD_IDX=$((FOLD_IDX + 1))
     done
 else
     echo "No run IDs specified — using existing checkpoints in kaggle_dataset/"
@@ -115,18 +135,15 @@ echo "Notebook version: $VERSION"
 echo ""
 
 # ── Step 4: Submit to competition ─────────────────────────────────────────────
-echo "=== Step 4: Submitting notebook to competition ==="
-SUBMIT_MSG="Ensemble: ${CKPT_COUNT} checkpoints"
-if [ $# -gt 0 ]; then
-    SUBMIT_MSG="$SUBMIT_MSG ($*)"
-fi
-
-kaggle competitions submit \
-    -c "$COMPETITION" \
-    -f submission.csv \
-    -k "$KERNEL_SLUG" \
-    -v "$VERSION" \
-    -m "$SUBMIT_MSG"
-
+# BirdCLEF is a code competition — the notebook is re-run on hidden test data.
+# API submission via `kaggle competitions submit` doesn't work (403 Forbidden).
+# Must submit through the Kaggle UI.
+echo "=== Step 4: Submit via Kaggle UI ==="
 echo ""
-echo "=== Done! Submission sent to $COMPETITION ==="
+echo "Notebook version $VERSION ran successfully. Submit to competition:"
+echo ""
+echo "  1. Go to: https://www.kaggle.com/code/arimarkowitz/birdclef-2026-inference"
+echo "  2. Click 'Output' tab → latest version"
+echo "  3. Click 'Submit to Competition'"
+echo ""
+echo "=== Done! ==="
