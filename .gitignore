@@ -8,3 +8,4 @@ __pycache__/
 *.pyc
 wandb/*
 *.out
+nmf_analysis/output/*
