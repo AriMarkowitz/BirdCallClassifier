@@ -1,16 +1,12 @@
 """
-Fine-tune HTSAT on BirdCLEF 2026 for multi-label classification.
+Fine-tune Bird-MAE-Base on BirdCLEF 2026 for multi-label classification.
 
 Usage:
-    python src/train.py --checkpoint path/to/HTSAT_AudioSet_Saved.ckpt
+    python src/train.py --checkpoint path/to/bird-mae-base.safetensors
 
-Key adjustments from AudioSet defaults:
-  - classes_num: 234 (from taxonomy.csv)
-  - Warmup reduced: 1 epoch at 0.1x LR, then cosine decay
-  - Lower LR: 3e-5 default (fine-tuning, not training from scratch)
-  - Batch size: 32 (single GPU default)
-  - Site-based validation split for realistic eval
-  - WeightedRandomSampler to upweight soundscape data
+Bird-MAE-Base is a ViT-B/16 (85M params) pretrained via masked autoencoder
+on BirdSet's 9.7k bird species. We add a linear classification head and
+fine-tune on BirdCLEF 2026 training data.
 """
 
 import os
@@ -21,155 +17,70 @@ import math
 
 import torch
 import torch.nn as nn
+import numpy as np
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 
-# Add HTSAT source to path
 PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(PROJ_ROOT, "external", "htsat"))
 sys.path.insert(0, os.path.join(PROJ_ROOT, "src"))
 
-import config as htsat_config
-from model.htsat import HTSAT_Swin_Transformer
-from sed_model import SEDWrapper
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from dataset import get_dataloaders, get_datasets, build_label_map, TEMPORAL_DIM
+from bird_mae.model import BirdMAEModel
+from bird_mae.config import BirdMAEConfig
+from bird_mae.feature_extractor import BirdMAEFeatureExtractor
+from sklearn.metrics import roc_auc_score
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def load_pretrained_htsat(checkpoint_path, config, num_classes):
+class BirdMAEWrapper(pl.LightningModule):
     """
-    Load an AudioSet-pretrained HTSAT checkpoint and replace the
-    classification head for `num_classes`.
+    Lightning wrapper for Bird-MAE fine-tuning on BirdCLEF.
+
+    The model:
+    1. Converts raw waveforms to fbank mel spectrograms (on GPU)
+    2. Runs Bird-MAE encoder to get 768-dim embeddings
+    3. Applies linear classification head -> num_classes logits
+    4. Sigmoid -> multi-label probabilities
     """
-    # Build model with original 527 classes to load weights
-    model_527 = HTSAT_Swin_Transformer(
-        spec_size=config.htsat_spec_size,
-        patch_size=config.htsat_patch_size,
-        patch_stride=config.htsat_stride,
-        num_classes=527,
-        embed_dim=config.htsat_dim,
-        depths=config.htsat_depth,
-        num_heads=config.htsat_num_head,
-        window_size=config.htsat_window_size,
-        config=config,
-    )
 
-    if checkpoint_path and os.path.isfile(checkpoint_path):
-        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        if "state_dict" in ckpt:
-            state_dict = ckpt["state_dict"]
-            state_dict = {
-                k.replace("sed_model.", ""): v
-                for k, v in state_dict.items()
-            }
-        else:
-            state_dict = ckpt
-
-        filtered = {
-            k: v for k, v in state_dict.items()
-            if "head" not in k and "tscam_conv" not in k
-        }
-        missing, unexpected = model_527.load_state_dict(filtered, strict=False)
-        logger.info(f"Loaded pretrained weights. Missing: {len(missing)}, "
-                    f"Unexpected: {len(unexpected)}")
-    else:
-        logger.warning("No checkpoint provided — training from scratch.")
-
-    # Rebuild with correct num_classes
-    model = HTSAT_Swin_Transformer(
-        spec_size=config.htsat_spec_size,
-        patch_size=config.htsat_patch_size,
-        patch_stride=config.htsat_stride,
-        num_classes=num_classes,
-        embed_dim=config.htsat_dim,
-        depths=config.htsat_depth,
-        num_heads=config.htsat_num_head,
-        window_size=config.htsat_window_size,
-        config=config,
-    )
-
-    # Copy backbone weights
-    src_dict = model_527.state_dict()
-    tgt_dict = model.state_dict()
-    for k in tgt_dict:
-        if "head" not in k and "tscam_conv" not in k and k in src_dict:
-            tgt_dict[k] = src_dict[k]
-    model.load_state_dict(tgt_dict)
-    logger.info(f"Head replaced: 527 -> {num_classes} classes")
-
-    return model
-
-
-class TemporalMLP(nn.Module):
-    """Small MLP that maps cyclical temporal features to a per-class logit bias."""
-
-    def __init__(self, temporal_dim, num_classes, hidden_dim=128, dropout=0.3):
+    def __init__(self, backbone, num_classes, learning_rate=1e-4,
+                 warmup_epochs=1, max_epochs=30, n_train_audio=0):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(temporal_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, num_classes),
-        )
-        # Initialize final layer to zeros so temporal MLP is a no-op at start
-        nn.init.zeros_(self.mlp[-1].weight)
-        nn.init.zeros_(self.mlp[-1].bias)
-
-    def forward(self, temporal_features):
-        return self.mlp(temporal_features)
-
-
-class BirdCLEFWrapper(pl.LightningModule):
-    """
-    Lightning wrapper for HTSAT fine-tuning on BirdCLEF.
-
-    Includes a temporal MLP that produces a per-class logit bias from cyclical
-    time-of-day and day-of-year features. In stage 1, temporal inputs are zeros
-    and the MLP learns to be a no-op. In stage 2, the backbone is frozen and
-    only the temporal MLP is trained on real temporal features.
-    """
-
-    def __init__(self, sed_model, config, num_classes, learning_rate=1e-4,
-                 warmup_epochs=1, max_epochs=30, n_train_audio=0,
-                 temporal_dim=4, stage=1):
-        super().__init__()
-        self.sed_model = sed_model
-        self.config = config
+        self.backbone = backbone
         self.num_classes = num_classes
         self.learning_rate = learning_rate
         self.warmup_epochs = warmup_epochs
         self.max_epochs = max_epochs
         self.n_train_audio = n_train_audio
-        self.stage = stage
-        self.loss_fn = nn.BCELoss()
-        self.temporal_mlp = TemporalMLP(temporal_dim, num_classes)
+        self.embed_dim = backbone.config.embed_dim  # 768
 
-    def forward(self, x, temporal=None, mix_lambda=None):
-        output_dict = self.sed_model(x, mix_lambda)
-        clipwise = output_dict["clipwise_output"]  # already sigmoided
+        self.head = nn.Linear(self.embed_dim, num_classes)
+        self.loss_fn = nn.BCEWithLogitsLoss()
+        self.feature_extractor = BirdMAEFeatureExtractor()
 
-        if temporal is not None:
-            # Convert sigmoid probs back to logits, add temporal bias, re-sigmoid
-            eps = 1e-6
-            logits = torch.log(clipwise.clamp(eps, 1 - eps) / (1 - clipwise.clamp(eps, 1 - eps)))
-            temporal_bias = self.temporal_mlp(temporal)
-            clipwise = torch.sigmoid(logits + temporal_bias)
+    def forward(self, waveform):
+        """
+        Args:
+            waveform: (B, samples) raw audio at 32kHz
 
-        return clipwise, output_dict["framewise_output"]
+        Returns:
+            probs: (B, num_classes) sigmoid probabilities
+        """
+        mel = self.feature_extractor(waveform)  # (B, 1, 512, 128)
+        mel = mel.to(self.device)
+        embeddings = self.backbone(mel)  # (B, 768)
+        logits = self.head(embeddings)  # (B, num_classes)
+        return logits
 
-    def _safe_loss(self, pred, target):
-        """Clamp predictions to [eps, 1-eps] and compute BCE in fp32."""
-        with torch.amp.autocast("cuda", enabled=False):
-            pred = pred.float().clamp(1e-6, 1.0 - 1e-6)
-            target = target.float()
-            return self.loss_fn(pred, target)
+    def _safe_loss(self, logits, target):
+        return self.loss_fn(logits, target)
 
     def training_step(self, batch, batch_idx):
-        pred, _ = self(batch["waveform"], temporal=batch.get("temporal"))
-        loss = self._safe_loss(pred, batch["target"])
+        logits = self(batch["waveform"])
+        loss = self._safe_loss(logits, batch["target"])
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         if batch_idx % 50 == 0:
             logger.info(f"Step {self.global_step} (epoch {self.current_epoch}, "
@@ -177,74 +88,53 @@ class BirdCLEFWrapper(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        pred, _ = self(batch["waveform"], temporal=batch.get("temporal"))
-        loss = self._safe_loss(pred, batch["target"])
-        self.log("val_loss", loss, on_epoch=True, prog_bar=True)
-        # Accumulate for epoch-end AUC computation
-        if not hasattr(self, "_val_preds"):
-            self._val_preds = []
-            self._val_targets = []
-        self._val_preds.append(pred.detach().cpu())
-        self._val_targets.append(batch["target"].detach().cpu())
+        logits = self(batch["waveform"])
+        loss = self._safe_loss(logits, batch["target"])
+        probs = torch.sigmoid(logits)
+        return {"val_loss": loss, "preds": probs.detach().cpu(), "targets": batch["target"].detach().cpu()}
 
-    def on_validation_epoch_end(self):
-        import numpy as np
-        from sklearn.metrics import roc_auc_score
+    def validation_epoch_end(self, outputs):
+        avg_loss = torch.stack([x["val_loss"] for x in outputs]).mean()
+        preds = torch.cat([x["preds"] for x in outputs]).numpy()
+        targets = torch.cat([x["targets"] for x in outputs]).numpy()
 
-        if not hasattr(self, "_val_preds") or len(self._val_preds) == 0:
-            return
-
-        preds = torch.cat(self._val_preds).numpy()
-        targets = torch.cat(self._val_targets).numpy()
-        self._val_preds.clear()
-        self._val_targets.clear()
-
+        # Macro AUC (skip classes not present in this fold's val set)
         try:
-            col_mask = targets.sum(axis=0) > 0
-            if col_mask.any():
-                macro_auc = roc_auc_score(
-                    targets[:, col_mask], preds[:, col_mask], average="macro"
-                )
-            else:
-                macro_auc = 0.0
+            per_class_auc = []
+            for i in range(self.num_classes):
+                if targets[:, i].sum() > 0 and targets[:, i].sum() < len(targets):
+                    per_class_auc.append(roc_auc_score(targets[:, i], preds[:, i]))
+            macro_auc = np.mean(per_class_auc) if per_class_auc else 0.0
         except Exception:
             macro_auc = 0.0
 
+        self.log("val_loss", avg_loss, prog_bar=True)
         self.log("val_macro_auc", macro_auc, prog_bar=True)
         logger.info(f"Epoch {self.current_epoch}: val_macro_auc={macro_auc:.4f}")
 
     def configure_optimizers(self):
-        if self.stage == 2:
-            # Stage 2: only train temporal MLP
-            params = self.temporal_mlp.parameters()
-        else:
-            params = filter(lambda p: p.requires_grad, self.parameters())
+        # Different LR for backbone vs head
+        backbone_params = list(self.backbone.parameters())
+        head_params = list(self.head.parameters())
 
-        optimizer = torch.optim.AdamW(
-            params,
-            lr=self.learning_rate,
-            betas=(0.9, 0.999),
-            eps=1e-8,
-            weight_decay=0.05,
-        )
+        optimizer = torch.optim.AdamW([
+            {"params": backbone_params, "lr": self.learning_rate},
+            {"params": head_params, "lr": self.learning_rate * 10},
+        ], betas=(0.9, 0.999), eps=1e-8, weight_decay=0.05)
 
         return optimizer
 
     def on_train_epoch_start(self):
-        """Curriculum: gradually increase soundscape weight over training."""
-        # Unwrap PL's dataloader wrappers to find the WeightedRandomSampler
+        """Curriculum learning: ramp soundscape weight over training."""
         sampler = None
         dl = self.trainer.train_dataloader
-        # PL 1.9 wraps in CombinedLoader; dig through possible wrappers
-        for attr in ['loaders', 'flattened']:
-            if hasattr(dl, attr):
-                val = getattr(dl, attr)
-                if isinstance(val, (list, tuple)):
-                    dl = val[0]
-                elif isinstance(val, dict):
-                    dl = list(val.values())[0]
-                break
-        # Now dl should be a DataLoader or another wrapper
+        if hasattr(dl, 'loaders'):
+            dl = dl.loaders
+        if isinstance(dl, dict):
+            for key, val in dl.items():
+                if hasattr(val, 'sampler'):
+                    dl = val
+                    break
         if hasattr(dl, 'sampler'):
             s = dl.sampler
             if isinstance(s, WeightedRandomSampler):
@@ -255,11 +145,8 @@ class BirdCLEFWrapper(pl.LightningModule):
                 logger.warning("Curriculum: could not find WeightedRandomSampler, skipping")
             return
 
-        # Curriculum schedule: ramp soundscape weight from 0.5 to 3.0
-        # Start with clean audio focus so model learns individual species,
-        # then ramp up soundscapes to learn noisy multi-species detection
         progress = self.current_epoch / max(self.max_epochs - 1, 1)
-        weight = 0.5 + 2.5 * progress  # 0.5 at epoch 0, 3.0 at final epoch
+        weight = 0.5 + 2.5 * progress
 
         n_total = len(sampler.weights)
         new_weights = torch.ones(n_total, dtype=torch.float64)
@@ -271,12 +158,12 @@ class BirdCLEFWrapper(pl.LightningModule):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fine-tune HTSAT on BirdCLEF 2026")
+    parser = argparse.ArgumentParser(description="Fine-tune Bird-MAE on BirdCLEF 2026")
     parser.add_argument("--data_dir", type=str,
                         default=os.path.join(PROJ_ROOT, "data"))
     parser.add_argument("--checkpoint", type=str, default=None,
-                        help="Path to AudioSet pretrained HTSAT checkpoint")
-    parser.add_argument("--batch_size", type=int, default=128)
+                        help="Path to Bird-MAE pretrained checkpoint (.safetensors)")
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -290,155 +177,81 @@ def main():
     parser.add_argument("--soundscape_weight", type=float, default=3.0,
                         help="Upweight soundscape samples in training sampler")
     parser.add_argument("--label_smoothing", type=float, default=0.1,
-                        help="Label smoothing factor (0=hard labels, 0.1=recommended)")
+                        help="Label smoothing factor")
     parser.add_argument("--use_wandb", action="store_true",
                         help="Enable Weights & Biases logging")
     parser.add_argument("--wandb_project", type=str, default="birdclef-2026",
                         help="W&B project name")
     parser.add_argument("--run_name", type=str, default=None,
-                        help="W&B run name (defaults to auto-generated)")
+                        help="W&B run name")
     parser.add_argument("--run_id", type=str, default=None,
-                        help="Run ID for checkpoint subdir (defaults to seed<N>)")
+                        help="Run ID for checkpoint subdir")
     parser.add_argument("--n_folds", type=int, default=5,
                         help="Number of CV folds")
     parser.add_argument("--fold", type=int, default=0,
-                        help="Which fold to hold out for validation (0 to n_folds-1)")
-    parser.add_argument("--stage", type=int, default=1, choices=[1, 2],
-                        help="Training stage: 1=full model with zeroed temporal, "
-                             "2=freeze backbone, train temporal MLP on soundscapes")
-    parser.add_argument("--stage1_ckpt", type=str, default=None,
-                        help="Stage 1 checkpoint to load for stage 2 training")
+                        help="Which fold to hold out for validation")
     args = parser.parse_args()
 
     pl.seed_everything(args.seed)
-
-    # Use tensor cores for fp32 matmuls (L40S has them)
     torch.set_float32_matmul_precision("medium")
 
-    # Patch config for our dataset
-    htsat_config.classes_num = len(
-        build_label_map(os.path.join(args.data_dir, "taxonomy.csv"))
+    # Build dataloaders (5s clips for Bird-MAE)
+    train_loader, val_loader, label_map, num_classes, n_train_audio = get_dataloaders(
+        args.data_dir,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        sample_rate=32000,
+        clip_duration=5.0,  # Bird-MAE uses 5s clips
+        val_frac=args.val_frac,
+        seed=args.seed,
+        soundscape_weight=args.soundscape_weight,
+        label_smoothing=args.label_smoothing,
+        n_folds=args.n_folds,
+        fold=args.fold,
     )
-    htsat_config.loss_type = "clip_bce"
-    htsat_config.enable_tscam = True
+    logger.info(f"Classes: {num_classes}, Train batches: {len(train_loader)}, "
+                f"Val batches: {len(val_loader)}")
 
-    if args.stage == 2:
-        # Stage 2: train temporal MLP only, on soundscape data only
-        assert args.stage1_ckpt, "--stage1_ckpt is required for stage 2"
-        logger.info(f"=== Stage 2: Temporal MLP training ===")
-        logger.info(f"Loading stage 1 checkpoint: {args.stage1_ckpt}")
+    # Curriculum schedule summary
+    logger.info(f"Curriculum training: soundscape_weight ramps 0.50 -> 3.00 "
+                f"linearly over {args.max_epochs} epochs")
 
-        # Build soundscape-only dataloaders (same fold split as stage 1)
-        train_ds, val_ds, label_map, num_classes, _, _ = get_datasets(
-            args.data_dir,
-            sample_rate=htsat_config.sample_rate,
-            clip_duration=htsat_config.clip_samples / htsat_config.sample_rate,
-            label_smoothing=args.label_smoothing,
-            n_folds=args.n_folds, fold=args.fold,
-        )
-        # For stage 2, train only on soundscape portion (skip train_audio in ConcatDataset)
-        # ConcatDataset = [TrainAudioDataset, Subset(SoundscapeDataset)]
-        # We want only the soundscape subset
-        sc_train = train_ds.datasets[1]  # Subset of SoundscapeDataset
-        sc_val = val_ds  # already soundscape-only
-
-        train_loader = DataLoader(
-            sc_train, batch_size=args.batch_size, shuffle=True,
-            num_workers=args.num_workers, pin_memory=True, drop_last=True,
-            persistent_workers=args.num_workers > 0,
-            prefetch_factor=4 if args.num_workers > 0 else None,
-        )
-        val_loader = DataLoader(
-            sc_val, batch_size=args.batch_size, shuffle=False,
-            num_workers=args.num_workers, pin_memory=True, drop_last=False,
-            persistent_workers=args.num_workers > 0,
-            prefetch_factor=4 if args.num_workers > 0 else None,
-        )
-
-        logger.info(f"Stage 2 data: {len(sc_train)} train, {len(sc_val)} val soundscape segments")
-
-        # Load full wrapper from stage 1 checkpoint
-        htsat_config.classes_num = num_classes
-        model = load_pretrained_htsat(None, htsat_config, num_classes)
-        wrapper = BirdCLEFWrapper(
-            model, htsat_config, num_classes,
-            learning_rate=args.lr,
-            max_epochs=args.max_epochs,
-            stage=2,
-        )
-        ckpt = torch.load(args.stage1_ckpt, map_location="cpu", weights_only=False)
-        wrapper.load_state_dict(ckpt["state_dict"], strict=False)
-        logger.info("Loaded stage 1 weights")
-
-        # Freeze everything except temporal MLP
-        for name, param in wrapper.named_parameters():
-            if "temporal_mlp" not in name:
-                param.requires_grad = False
-        trainable = sum(p.numel() for p in wrapper.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in wrapper.parameters())
-        logger.info(f"Trainable params: {trainable:,} / {total:,} "
-                    f"({100*trainable/total:.2f}%)")
-
-        n_train_audio = 0  # no curriculum needed
+    # Build model
+    mae_config = BirdMAEConfig()
+    if args.checkpoint and os.path.isfile(args.checkpoint):
+        logger.info(f"Loading pretrained Bird-MAE from: {args.checkpoint}")
+        backbone = BirdMAEModel.from_pretrained(args.checkpoint, config=mae_config)
     else:
-        # Stage 1: full model training with zeroed temporal inputs
-        logger.info(f"=== Stage 1: Full model training (temporal inputs zeroed) ===")
+        logger.warning("No checkpoint — training Bird-MAE from scratch (not recommended)")
+        backbone = BirdMAEModel(mae_config)
 
-        # Build dataloaders
-        train_loader, val_loader, label_map, num_classes, n_train_audio = get_dataloaders(
-            args.data_dir,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            sample_rate=htsat_config.sample_rate,
-            clip_duration=htsat_config.clip_samples / htsat_config.sample_rate,
-            val_frac=args.val_frac,
-            seed=args.seed,
-            soundscape_weight=args.soundscape_weight,
-            label_smoothing=args.label_smoothing,
-            n_folds=args.n_folds,
-            fold=args.fold,
-        )
-        logger.info(f"Classes: {num_classes}, Train batches: {len(train_loader)}, "
-                    f"Val batches: {len(val_loader)}")
+    wrapper = BirdMAEWrapper(
+        backbone, num_classes,
+        learning_rate=args.lr,
+        warmup_epochs=args.warmup_epochs,
+        max_epochs=args.max_epochs,
+        n_train_audio=n_train_audio,
+    )
 
-        # Curriculum schedule summary
-        logger.info(f"Curriculum training: soundscape_weight ramps 0.50 -> 3.00 "
-                    f"linearly over {args.max_epochs} epochs")
-        logger.info(f"  Epoch 0: weight=0.50 (clean audio focus)")
-        mid = args.max_epochs // 2
-        mid_w = 0.5 + 4.5 * (mid / max(args.max_epochs - 1, 1))
-        logger.info(f"  Epoch {mid}: weight={mid_w:.2f}")
-        logger.info(f"  Epoch {args.max_epochs - 1}: weight=3.00 (soundscape focus)")
+    total = sum(p.numel() for p in wrapper.parameters())
+    trainable = sum(p.numel() for p in wrapper.parameters() if p.requires_grad)
+    logger.info(f"Model params: {total:,} total, {trainable:,} trainable")
 
-        # Build model
-        htsat_config.classes_num = num_classes
-        model = load_pretrained_htsat(args.checkpoint, htsat_config, num_classes)
-        wrapper = BirdCLEFWrapper(
-            model, htsat_config, num_classes,
-            learning_rate=args.lr,
-            warmup_epochs=args.warmup_epochs,
-            max_epochs=args.max_epochs,
-            n_train_audio=n_train_audio,
-            stage=1,
-        )
-
-    # Save checkpoints in a run-specific subdirectory
+    # Save checkpoints
     run_id = args.run_id or f"seed{args.seed}"
     run_save_dir = os.path.join(args.save_dir, run_id)
     os.makedirs(run_save_dir, exist_ok=True)
     logger.info(f"Checkpoints will be saved to: {run_save_dir}")
 
-    # Callbacks
     ckpt_callback = ModelCheckpoint(
         dirpath=run_save_dir,
-        filename="birdclef-htsat-{epoch:02d}-{val_macro_auc:.4f}",
+        filename="birdclef-birdmae-{epoch:02d}-{val_macro_auc:.4f}",
         monitor="val_macro_auc",
         mode="max",
         save_top_k=5,
     )
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
 
-    # Logger
     loggers = []
     if args.use_wandb:
         from pytorch_lightning.loggers import WandbLogger
@@ -450,14 +263,11 @@ def main():
                 "batch_size": args.batch_size,
                 "max_epochs": args.max_epochs,
                 "seed": args.seed,
-                "val_frac": args.val_frac,
                 "soundscape_weight": args.soundscape_weight,
-                "warmup_epochs": args.warmup_epochs,
                 "label_smoothing": args.label_smoothing,
                 "fold": args.fold,
                 "n_folds": args.n_folds,
-                "model": "htsat-tiny",
-                "stage": args.stage,
+                "model": "bird-mae-base",
             },
         )
         loggers.append(wandb_logger)
