@@ -27,9 +27,10 @@ else
     echo "Mode: best val_macro_auc checkpoint per run"
 fi
 
-# Clear old checkpoints
+# Clear old checkpoints and HTSAT artifacts
 rm -f "$KAGGLE_DS"/birdclef-birdmae-*.ckpt
 rm -f "$KAGGLE_DS"/birdclef-htsat-*.ckpt
+rm -rf "$KAGGLE_DS/htsat"
 echo "Cleared old checkpoints from kaggle_dataset/"
 
 # Sync Bird-MAE source code for Kaggle inference imports
@@ -59,9 +60,10 @@ if [ $# -gt 0 ]; then
             echo "ERROR: No checkpoints in $run_dir"
             exit 1
         fi
-        # Use unique name per fold to avoid overwrites when filenames collide
+        # Use unique name per fold; replace '=' with '-' (Kaggle mangles '=' in filenames)
         ext="${picked##*.}"
         base="$(basename "$picked" ".$ext")"
+        base="${base//=/-}"
         dest="$KAGGLE_DS/${base}_fold${FOLD_IDX}.${ext}"
         cp "$picked" "$dest"
         echo "  Copied: $(basename "$dest") (from $run_id)"

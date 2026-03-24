@@ -44,11 +44,29 @@ for p in [f"{_INPUT}/birdclef-2026-model",
 assert COMPETITION_DATA, f"Competition data not found. /kaggle/input contains: {os.listdir(_INPUT)}"
 assert MODEL_DATASET, f"Model dataset not found. /kaggle/input contains: {os.listdir(_INPUT)}"
 
+# Robust checkpoint discovery with fallback patterns
 checkpoint_patterns = [
     os.path.join(MODEL_DATASET, "birdclef-birdmae-*.ckpt"),
     os.path.join(MODEL_DATASET, "*birdmae*.ckpt"),
+    os.path.join(MODEL_DATASET, "*.ckpt"),  # fallback: any .ckpt file
 ]
 CHECKPOINT_PATHS = sorted({cp for pattern in checkpoint_patterns for cp in glob.glob(pattern)})
+
+# If glob found nothing, list the directory for debugging
+if not CHECKPOINT_PATHS:
+    print(f"DEBUG: No checkpoints found via glob patterns.")
+    print(f"Contents of {MODEL_DATASET}:")
+    try:
+        for item in sorted(os.listdir(MODEL_DATASET)):
+            full_path = os.path.join(MODEL_DATASET, item)
+            if os.path.isfile(full_path):
+                size_mb = os.path.getsize(full_path) / (1024 ** 2)
+                print(f"  [FILE] {item} ({size_mb:.1f} MB)")
+            elif os.path.isdir(full_path):
+                print(f"  [DIR]  {item}/")
+    except Exception as e:
+        print(f"  Error listing directory: {e}")
+
 BIRD_MAE_CODE = os.path.join(MODEL_DATASET, "bird_mae")
 TAXONOMY_PATH = os.path.join(COMPETITION_DATA, "taxonomy.csv")
 
