@@ -66,6 +66,15 @@ if [ ! -f "$CKPT_PATH" ]; then
         -O "$CKPT_PATH" || echo "WARNING: Checkpoint download failed. Will train from scratch."
 fi
 
+# ── Preprocess: detect active vocal regions (one-time, cached) ──
+VALID_REGIONS="$PROJECT_DIR/data/valid_regions.json"
+if [ ! -f "$VALID_REGIONS" ]; then
+    echo "Detecting active vocal regions in train_audio (one-time preprocessing)..."
+    python scripts/preprocess_activity.py \
+        --data-dir "$PROJECT_DIR/data" \
+        --output "$VALID_REGIONS"
+fi
+
 # ── Fold and seed (override via environment: FOLD=2 sbatch train.sh) ──
 FOLD="${FOLD:-0}"
 SEED="${SEED:-42}"
@@ -89,6 +98,7 @@ python src/train.py \
     --use_wandb \
     --wandb_project birdclef-2026 \
     --run_name "htsat-${RUN_ID}" \
-    --run_id "$RUN_ID"
+    --run_id "$RUN_ID" \
+    --valid_regions "$VALID_REGIONS"
 
 echo "Training complete (run=$RUN_ID, fold=$FOLD)."

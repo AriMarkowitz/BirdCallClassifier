@@ -47,7 +47,8 @@ class TrainAudioDataset(Dataset):
     """
 
     def __init__(self, csv_path, audio_dir, label_map, sample_rate=32000,
-                 clip_duration=10.0, label_smoothing=0.0, preload=False):
+                 clip_duration=10.0, label_smoothing=0.0, preload=False,
+                 valid_regions=None):
         self.audio_dir = audio_dir
         self.label_map = label_map
         self.sample_rate = sample_rate
@@ -61,6 +62,24 @@ class TrainAudioDataset(Dataset):
         df = df[df["primary_label"].isin(label_map)].reset_index(drop=True)
         self.filenames = df["filename"].values
         self.labels = df["primary_label"].values
+
+        # Valid vocal regions per file (from preprocess_activity.py)
+        # Maps filename -> list of (start_sample, end_sample) tuples
+        self._valid_regions = {}
+        if valid_regions is not None:
+            n_with_regions = 0
+            for fn in self.filenames:
+                if fn in valid_regions:
+                    # Convert seconds to samples
+                    regions = []
+                    for start_sec, end_sec in valid_regions[fn]:
+                        regions.append((
+                            int(start_sec * sample_rate),
+                            int(end_sec * sample_rate),
+                        ))
+                    self._valid_regions[fn] = regions
+                    n_with_regions += 1
+            logger.info(f"Valid regions loaded for {n_with_regions}/{len(self.filenames)} files")
 
         # Parse secondary labels
         import ast
@@ -93,8 +112,7 @@ class TrainAudioDataset(Dataset):
     def _preload_all(self):
         """Load all audio files into RAM, cropped to clip_samples.
 
-        Clips longer than clip_samples get a random crop (fixed per epoch,
-        but multi-species mixing + SuMix provide ample diversity).
+        Uses valid_regions if available to crop from active vocal regions.
         This keeps RAM predictable: N * clip_samples * 4 bytes.
         """
         logger.info(f"Preloading {len(self.filenames)} audio files into RAM "
@@ -104,7 +122,8 @@ class TrainAudioDataset(Dataset):
         for i, fn in enumerate(self.filenames):
             path = os.path.join(self.audio_dir, fn)
             audio = self._load_audio_raw(path)
-            audio = self._fit_length(audio)  # crop/pad to clip_samples
+            regions = self._valid_regions.get(fn)
+            audio = self._crop_from_regions(audio, regions)
             waveforms.append(audio)
             if (i + 1) % 5000 == 0:
                 logger.info(f"  Preloaded {i + 1}/{len(self.filenames)}")
@@ -134,14 +153,49 @@ class TrainAudioDataset(Dataset):
             waveform = self._waveforms[index].copy()
         else:
             filepath = os.path.join(self.audio_dir, self.filenames[index])
-            waveform = self._fit_length(self._load_audio_raw(filepath))
+            audio = self._load_audio_raw(filepath)
+            regions = self._valid_regions.get(self.filenames[index])
+            waveform = self._crop_from_regions(audio, regions)
         return {
             "waveform": waveform,
             "target": self._targets[index].copy(),
         }
 
+    def _crop_from_regions(self, audio, regions):
+        """Crop clip_samples from a valid vocal region.
+
+        If valid_regions are available, picks a random region weighted by
+        duration, then picks a random start within it. If the region is
+        shorter than clip_samples, pads with silence. Falls back to random
+        crop if no regions are available.
+        """
+        if not regions:
+            return self._fit_length(audio)
+
+        # Weight regions by duration so longer active stretches are preferred
+        durations = np.array([max(end - start, 1) for start, end in regions],
+                             dtype=np.float64)
+        probs = durations / durations.sum()
+        region_idx = np.random.choice(len(regions), p=probs)
+        reg_start, reg_end = regions[region_idx]
+
+        # Clamp to actual audio length
+        reg_start = max(0, min(reg_start, len(audio)))
+        reg_end = max(reg_start, min(reg_end, len(audio)))
+        reg_len = reg_end - reg_start
+
+        if reg_len >= self.clip_samples:
+            # Random crop within the region
+            start = reg_start + np.random.randint(0, reg_len - self.clip_samples + 1)
+            return audio[start:start + self.clip_samples].astype(np.float32)
+        else:
+            # Region shorter than clip_samples — use what we have and pad
+            clip = audio[reg_start:reg_end].astype(np.float32)
+            pad = np.zeros(self.clip_samples - len(clip), dtype=np.float32)
+            return np.concatenate([clip, pad])
+
     def _fit_length(self, audio):
-        """Pad with zeros or randomly crop to exactly clip_samples."""
+        """Pad with zeros or randomly crop to exactly clip_samples (fallback)."""
         if len(audio) < self.clip_samples:
             pad = np.zeros(self.clip_samples - len(audio), dtype=np.float32)
             audio = np.concatenate([audio, pad])
@@ -284,7 +338,8 @@ class SoundscapeDataset(Dataset):
 
 def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
                  seed=42, label_smoothing=0.0, n_folds=5, fold=0,
-                 multi_mix=True, mix_prob=0.7, preload=False):
+                 multi_mix=True, mix_prob=0.7, preload=False,
+                 valid_regions_path=None):
     """
     Build train/val datasets with k-fold CV.
 
@@ -314,18 +369,32 @@ def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
     num_classes = len(label_map)
     logger.info(f"Number of classes: {num_classes}")
 
+    # Load valid vocal regions if available
+    import json
+    valid_regions = None
+    if valid_regions_path and os.path.isfile(valid_regions_path):
+        with open(valid_regions_path) as f:
+            valid_regions = json.load(f)
+        logger.info(f"Loaded valid regions from {valid_regions_path} "
+                     f"({len(valid_regions)} files)")
+    elif valid_regions_path:
+        logger.warning(f"Valid regions file not found: {valid_regions_path}, "
+                        f"falling back to random cropping")
+
     # --- Train audio: split into train/val by primary_label (stratified) ---
     # Preload waveforms into RAM to avoid repeated disk I/O during mixing
     audio_ds_full = TrainAudioDataset(
         train_csv, audio_dir, label_map,
         sample_rate=sample_rate, clip_duration=clip_duration,
         label_smoothing=label_smoothing, preload=preload,
+        valid_regions=valid_regions,
     )
     # Val dataset: hard labels, shares preloaded waveforms to avoid double RAM
     audio_ds_val_hard = TrainAudioDataset(
         train_csv, audio_dir, label_map,
         sample_rate=sample_rate, clip_duration=clip_duration,
         label_smoothing=0.0, preload=False,
+        valid_regions=valid_regions,
     )
     if preload and audio_ds_full._waveforms is not None:
         audio_ds_val_hard._waveforms = audio_ds_full._waveforms
@@ -471,7 +540,7 @@ def get_dataloaders(data_dir, batch_size=32, num_workers=4, sample_rate=32000,
                     clip_duration=10.0, val_frac=0.25, seed=42,
                     label_smoothing=0.0,
                     n_folds=5, fold=0, multi_mix=True, mix_prob=0.7,
-                    preload=False):
+                    preload=False, valid_regions_path=None):
     """
     Convenience function returning DataLoaders ready for training.
 
@@ -481,7 +550,7 @@ def get_dataloaders(data_dir, batch_size=32, num_workers=4, sample_rate=32000,
         data_dir, sample_rate=sample_rate, clip_duration=clip_duration,
         val_frac=val_frac, seed=seed, label_smoothing=label_smoothing,
         n_folds=n_folds, fold=fold, multi_mix=multi_mix, mix_prob=mix_prob,
-        preload=preload,
+        preload=preload, valid_regions_path=valid_regions_path,
     )
 
     sampler = _build_class_balanced_sampler(

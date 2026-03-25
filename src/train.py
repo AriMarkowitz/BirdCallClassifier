@@ -305,6 +305,8 @@ def main():
                         help="Beta distribution alpha for SuMix (0=disabled)")
     parser.add_argument("--preload", action="store_true",
                         help="Preload all train_audio waveforms into RAM (~34GB) for faster mixing")
+    parser.add_argument("--valid_regions", type=str, default=None,
+                        help="Path to valid_regions.json from preprocess_activity.py")
     args = parser.parse_args()
 
     pl.seed_everything(args.seed)
@@ -336,6 +338,7 @@ def main():
         multi_mix=args.multi_mix,
         mix_prob=args.mix_prob,
         preload=args.preload,
+        valid_regions_path=args.valid_regions,
     )
     logger.info(f"Classes: {num_classes}, Train batches: {len(train_loader)}, "
                 f"Val batches: {len(val_loader)}")
