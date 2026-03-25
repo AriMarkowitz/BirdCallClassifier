@@ -91,7 +91,7 @@ Build a fixed global latent dictionary from representative spectrogram data, the
 
 ## Tier 3 — Deprioritized / blocked
 
-- [ ] **Two-stage temporal fusion** — implemented, made score worse. Temporal MLP overfits on small soundscape training set. May revisit after pseudo-labeling massively increases soundscape training data.
+- [x] **Two-stage temporal fusion** — implemented and removed. Temporal MLP overfits on small soundscape training set, did not improve Kaggle score. Code removed from train.py and dataset.py.
 - [ ] **Cross-validation ensemble diversity** — vary hyperparameters across folds. Diminishing returns.
 - [ ] **Google Perch v2** — blocked by TensorFlow-only, GPU-only. Worth revisiting if PyTorch port appears.
 - [ ] **AudioProtoPNet** — 0.3B params, too large for Kaggle CPU inference.

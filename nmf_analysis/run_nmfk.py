@@ -248,7 +248,13 @@ def main():
     log.info(f"Loaded V: {V_np.shape} ({V_np.nbytes / 1e9:.2f} GB)")
     log.info(f"Solver: {args.algo}, perturbation std: {args.perturb_std}")
 
-    k_values = list(range(args.k_min, args.k_max + 1, args.k_step))
+    # k cannot exceed min(f, T) — NNDSVD init needs that many singular vectors
+    f, T = V_np.shape
+    max_k = min(args.k_max, f, T)
+    if max_k < args.k_max:
+        log.warning(f"Capping k_max from {args.k_max} to {max_k} (V has {f} frequency bins)")
+
+    k_values = [k for k in range(args.k_min, max_k + 1, args.k_step)]
     total_fits = len(k_values) * args.n_runs
     log.info(f"Testing k={k_values} ({len(k_values)} values × {args.n_runs} runs = {total_fits} total NMF fits)")
 

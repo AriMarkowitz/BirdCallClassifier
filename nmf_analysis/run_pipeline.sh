@@ -39,9 +39,9 @@ echo ""
 echo "=== Step 2: Run NMFk rank selection ==="
 python nmf_analysis/run_nmfk.py \
     --input-dir nmf_analysis/output \
-    --k-min 100 \
-    --k-max 200 \
-    --k-step 10 \
+    --k-min 52 \
+    --k-max 60 \
+    --k-step 1 \
     --n-runs 10 \
     --algo hals \
     --perturb-std 0.01

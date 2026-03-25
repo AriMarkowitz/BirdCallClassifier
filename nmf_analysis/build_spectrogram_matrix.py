@@ -20,12 +20,14 @@ import pandas as pd
 from tqdm import tqdm
 
 # --------------------------------------------------------------------------- #
-# Config — match the main model's spectrogram pipeline
+# Config — match HTSAT's spectrogram pipeline
 # --------------------------------------------------------------------------- #
 SAMPLE_RATE = 32000
 N_FFT = 1024
-HOP_LENGTH = 320  # 10ms at 32kHz (matches Bird-MAE frame_shift=10ms)
-N_MELS = 128
+HOP_LENGTH = 320  # 10ms at 32kHz (matches HTSAT hop_size)
+N_MELS = 64       # matches HTSAT mel_bins
+FMIN = 50         # matches HTSAT fmin
+FMAX = 14000      # matches HTSAT fmax
 CLIP_DURATION = 5.0  # seconds
 CLIP_SAMPLES = int(SAMPLE_RATE * CLIP_DURATION)
 
@@ -41,6 +43,8 @@ def compute_mel_spectrogram(audio: np.ndarray) -> np.ndarray:
         n_fft=N_FFT,
         hop_length=HOP_LENGTH,
         n_mels=N_MELS,
+        fmin=FMIN,
+        fmax=FMAX,
         power=2.0,
     )
     # Floor to small positive value to keep nonneg

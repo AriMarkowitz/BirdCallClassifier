@@ -79,7 +79,7 @@ python src/train.py \
     --checkpoint "$CKPT_PATH" \
     --batch_size 128 \
     --num_workers 8 \
-    --max_epochs 40 \
+    --max_epochs 12 \
     --lr 1e-4 \
     --save_dir "$CKPT_DIR" \
     --seed "$SEED" \
