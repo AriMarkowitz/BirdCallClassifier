@@ -63,6 +63,13 @@ Only 66 of 10,658 soundscape files have labels (1,478 segments). The other 10,59
 - [ ] **BirdSet XCM pretraining (stage 0)** — 89k focal recordings, 409 species, 89GB. Fine-tune backbone on XCM first, then on BirdCLEF data. Stays within current architecture. Need to check species overlap with our 234 classes.
 - [ ] **BirdSet XCL (full dataset)** — 528k recordings, 9.7k species, 484GB. Maximum pretraining data but significant storage/compute requirements.
 - [ ] **Add geographically relevant non-bird data** — incorporate insects / amphibians (and possibly other taxa present in the competition taxonomy) from similar South American / Pantanal-adjacent soundscapes. Goal: improve negative class modeling, reduce false bird positives, and better match the real acoustic background distribution at test time.
+- [ ] **Supplemental audio for undersampled species** — 14 species have ≤5 training samples and zero soundscape labels (mostly frogs, plus a marmoset, a nightjar, a titi monkey, and feral horse). These are effectively unlearnable from our data alone. Sources to pull from:
+  - **Xeno-canto** — largest open bird/wildlife sound archive; some frog coverage but spotty for rare Neotropical species
+  - **iNaturalist** — has audio observations, especially for herps; search by species + Pantanal/Mato Grosso region
+  - **Fonoteca Neotropical (FN)** — specialized Neotropical animal sound archive hosted by Instituto Humboldt; best coverage for South American frogs and mammals
+  - **YouTube field recordings** — search species common name + "call" or "vocalization"; extract audio clips and manually verify
+  - Priority targets (1 training sample each): Hooded Capuchin (516975), Waxy Monkey Tree Frog (23724), Southern Spectacled Caiman (116570), Central Dwarf Frog (23150)
+  - Secondary targets (2-3 samples): Mato Grosso Snouted Tree Frog (24321), Cei's White-lipped Frog (70711), Feral Horse (209233), Cuyaba Dwarf Frog (476521), Muller's Termite Frog (25214), Yungas de la Paz Poison Frog (64898), Black-tailed Marmoset (74580), Usina Tree Frog (555123), Spot-tailed Nightjar (sptnig1), Cope's Swamp Froglet (23176)
 
 ### 8. Class-balanced sampling / reweighting
 - [ ] **Balanced label sampling** — test a sampler that increases exposure of underrepresented labels so all classes are seen more uniformly during training. Important for multi-label data: balance by positive-label coverage, not just by clip count.

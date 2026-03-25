@@ -134,7 +134,7 @@ class BirdCLEFWrapper(pl.LightningModule):
     def __init__(self, sed_model, config, num_classes, learning_rate=1e-4,
                  warmup_epochs=1, max_epochs=30,
                  loss_type="bce", focal_alpha=0.25, focal_gamma=2.0,
-                 mixup_alpha=0.4):
+                 mixup_alpha=0.4, idx_to_label=None):
         super().__init__()
         self.sed_model = sed_model
         self.config = config
@@ -143,6 +143,7 @@ class BirdCLEFWrapper(pl.LightningModule):
         self.warmup_epochs = warmup_epochs
         self.max_epochs = max_epochs
         self.mixup_alpha = mixup_alpha
+        self.idx_to_label = idx_to_label or {}
         if loss_type == "focal":
             self.loss_fn = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
             logger.info(f"Using FocalLoss (alpha={focal_alpha}, gamma={focal_gamma})")
@@ -229,8 +230,21 @@ class BirdCLEFWrapper(pl.LightningModule):
         self._val_preds.clear()
         self._val_targets.clear()
 
+        # Per-class AUC (only for classes with positive samples in val)
+        per_class_auc = {}
+        col_mask = targets.sum(axis=0) > 0
+        for i in range(self.num_classes):
+            if not col_mask[i]:
+                continue
+            try:
+                auc_i = roc_auc_score(targets[:, i], preds[:, i])
+                sp_name = self.idx_to_label.get(i, f"class_{i}")
+                per_class_auc[sp_name] = auc_i
+            except Exception:
+                pass
+
+        # Macro AUC
         try:
-            col_mask = targets.sum(axis=0) > 0
             if col_mask.any():
                 macro_auc = roc_auc_score(
                     targets[:, col_mask], preds[:, col_mask], average="macro"
@@ -241,7 +255,38 @@ class BirdCLEFWrapper(pl.LightningModule):
             macro_auc = 0.0
 
         self.log("val_macro_auc", macro_auc, prog_bar=True)
-        logger.info(f"Epoch {self.current_epoch}: val_macro_auc={macro_auc:.4f}")
+        self.log("val_n_evaluable_classes", float(len(per_class_auc)))
+        logger.info(f"Epoch {self.current_epoch}: val_macro_auc={macro_auc:.4f} "
+                     f"({len(per_class_auc)} evaluable classes)")
+
+        # Log top-10 best and worst per-class AUCs
+        if per_class_auc:
+            sorted_aucs = sorted(per_class_auc.items(), key=lambda x: x[1])
+            worst10 = sorted_aucs[:10]
+            best10 = sorted_aucs[-10:]
+
+            logger.info(f"  Worst 10 AUC: " +
+                         ", ".join(f"{sp}={auc:.3f}" for sp, auc in worst10))
+            logger.info(f"  Best 10 AUC: " +
+                         ", ".join(f"{sp}={auc:.3f}" for sp, auc in best10))
+
+            # Store for W&B (logged via self.logger if available)
+            if self.logger and hasattr(self.logger, "experiment"):
+                try:
+                    import wandb
+                    # Log worst/best as a summary table each epoch
+                    table = wandb.Table(columns=["species", "auc", "rank"])
+                    for rank, (sp, auc) in enumerate(sorted_aucs):
+                        table.add_data(sp, round(auc, 4), rank + 1)
+                    self.logger.experiment.log({
+                        "val/per_class_auc_table": table,
+                        "val/worst_class_auc": worst10[0][1],
+                        "val/best_class_auc": best10[-1][1],
+                        "val/median_class_auc": float(np.median(
+                            [v for v in per_class_auc.values()])),
+                    })
+                except Exception:
+                    pass  # W&B not available or not configured
 
     def configure_optimizers(self):
         params = filter(lambda p: p.requires_grad, self.parameters())
@@ -256,6 +301,29 @@ class BirdCLEFWrapper(pl.LightningModule):
 
         return optimizer
 
+
+
+def _load_pseudo_label_summary(pseudo_labels_csv):
+    """Load pseudo-label summary JSON (saved alongside CSV) for W&B config."""
+    if not pseudo_labels_csv:
+        return {}
+    import json
+    from pathlib import Path
+    summary_path = Path(pseudo_labels_csv).with_suffix(".json")
+    if not summary_path.is_file():
+        return {}
+    try:
+        with open(summary_path) as f:
+            s = json.load(f)
+        return {
+            "pseudo_threshold": s.get("threshold"),
+            "pseudo_segments_kept": s.get("segments_kept"),
+            "pseudo_yield_rate": s.get("yield_rate"),
+            "pseudo_unique_species": s.get("unique_species"),
+            "pseudo_mean_conf": s.get("confidence_distribution", {}).get("mean"),
+        }
+    except Exception:
+        return {}
 
 
 def main():
@@ -307,6 +375,8 @@ def main():
                         help="Preload all train_audio waveforms into RAM (~34GB) for faster mixing")
     parser.add_argument("--valid_regions", type=str, default=None,
                         help="Path to valid_regions.json from preprocess_activity.py")
+    parser.add_argument("--pseudo_labels", type=str, default=None,
+                        help="Path to pseudo_labels.csv from pseudo_label.py")
     args = parser.parse_args()
 
     pl.seed_everything(args.seed)
@@ -339,6 +409,7 @@ def main():
         mix_prob=args.mix_prob,
         preload=args.preload,
         valid_regions_path=args.valid_regions,
+        pseudo_labels_csv=args.pseudo_labels,
     )
     logger.info(f"Classes: {num_classes}, Train batches: {len(train_loader)}, "
                 f"Val batches: {len(val_loader)}")
@@ -346,6 +417,7 @@ def main():
     # Build model
     htsat_config.classes_num = num_classes
     model = load_pretrained_htsat(args.checkpoint, htsat_config, num_classes)
+    idx_to_label = {v: k for k, v in label_map.items()}
     wrapper = BirdCLEFWrapper(
         model, htsat_config, num_classes,
         learning_rate=args.lr,
@@ -355,6 +427,7 @@ def main():
         focal_alpha=args.focal_alpha,
         focal_gamma=args.focal_gamma,
         mixup_alpha=args.mixup_alpha,
+        idx_to_label=idx_to_label,
     )
 
     # Save checkpoints in a run-specific subdirectory
@@ -397,6 +470,9 @@ def main():
                 "multi_mix": args.multi_mix,
                 "mix_prob": args.mix_prob,
                 "mixup_alpha": args.mixup_alpha,
+                "pseudo_labels": args.pseudo_labels,
+                "n_train_audio": n_train_audio,
+                **_load_pseudo_label_summary(args.pseudo_labels),
             },
         )
         loggers.append(wandb_logger)

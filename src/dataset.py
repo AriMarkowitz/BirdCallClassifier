@@ -339,7 +339,7 @@ class SoundscapeDataset(Dataset):
 def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
                  seed=42, label_smoothing=0.0, n_folds=5, fold=0,
                  multi_mix=True, mix_prob=0.7, preload=False,
-                 valid_regions_path=None):
+                 valid_regions_path=None, pseudo_labels_csv=None):
     """
     Build train/val datasets with k-fold CV.
 
@@ -399,7 +399,9 @@ def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
     if preload and audio_ds_full._waveforms is not None:
         audio_ds_val_hard._waveforms = audio_ds_full._waveforms
 
-    # Stratified split: hold out 1/n_folds of each label's clips for val
+    # Stratified split: hold out 1/n_folds of each label's clips for val.
+    # Guarantee every species has at least 1 sample in val so all classes
+    # are evaluable for per-class AUC.
     n_audio = len(audio_ds_full)
     rng_audio = np.random.RandomState(42)
     label_to_indices = {}
@@ -411,9 +413,28 @@ def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
     for lbl, idxs in label_to_indices.items():
         idxs = np.array(idxs)
         rng_audio.shuffle(idxs)
-        fold_sz = max(len(idxs) // n_folds, 1)
+        n = len(idxs)
+
+        if n == 1:
+            # Only 1 sample: put in both train and val (duplicated into val
+            # so the class is evaluable; also kept in train so it's learned)
+            audio_val_idx.extend(idxs.tolist())
+            audio_train_idx.extend(idxs.tolist())
+            continue
+
+        # At least 1 per fold, but respect fold boundaries
+        fold_sz = max(n // n_folds, 1)
         v_start = fold * fold_sz
-        v_end = v_start + fold_sz if fold < n_folds - 1 else len(idxs)
+        v_end = v_start + fold_sz if fold < n_folds - 1 else n
+
+        # If this fold's slice is empty (fold index beyond available data),
+        # take the last sample to guarantee representation
+        if v_start >= n:
+            audio_val_idx.append(idxs[-1])
+            audio_train_idx.extend(idxs.tolist())
+            continue
+
+        v_end = min(v_end, n)
         audio_val_idx.extend(idxs[v_start:v_end].tolist())
         audio_train_idx.extend(np.concatenate([idxs[:v_start], idxs[v_end:]]).tolist())
 
@@ -429,8 +450,10 @@ def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
     else:
         audio_train_mixed = audio_train_sub
 
-    # --- Soundscape segments: k-fold split ---
-    soundscape_ds_train = SoundscapeDataset(
+    # --- Soundscape segments: stratified k-fold split ---
+    # Ground-truth soundscape dataset (no pseudo-labels) for splitting.
+    # Pseudo-labels are added to the train portion only after the split.
+    soundscape_ds_gt = SoundscapeDataset(
         soundscape_csv, soundscape_dir, label_map,
         sample_rate=sample_rate, clip_duration=clip_duration,
         label_smoothing=label_smoothing,
@@ -441,19 +464,56 @@ def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
         label_smoothing=0.0,
     )
 
-    n_sc = len(soundscape_ds_train)
-    sc_indices = np.arange(n_sc)
+    # Stratified split by species so val contains all soundscape species
+    n_sc_gt = len(soundscape_ds_gt)
     rng_sc = np.random.RandomState(42)
-    rng_sc.shuffle(sc_indices)
 
-    fold_size = n_sc // n_folds
-    val_start = fold * fold_size
-    val_end = val_start + fold_size if fold < n_folds - 1 else n_sc
-    sc_val_indices = sc_indices[val_start:val_end]
-    sc_train_indices = np.concatenate([sc_indices[:val_start], sc_indices[val_end:]])
+    sc_label_to_indices = {}
+    for i, entry in enumerate(soundscape_ds_gt.entries):
+        # Use first label as stratification key
+        key = entry["label_indices"][0]
+        sc_label_to_indices.setdefault(key, []).append(i)
 
-    sc_train = Subset(soundscape_ds_train, sc_train_indices.tolist())
-    sc_val = Subset(soundscape_ds_val, sc_val_indices.tolist())
+    sc_train_indices = []
+    sc_val_indices = []
+    for key, idxs in sc_label_to_indices.items():
+        idxs = np.array(idxs)
+        rng_sc.shuffle(idxs)
+        n = len(idxs)
+
+        if n == 1:
+            # Same as train_audio: put in both so class is evaluable
+            sc_val_indices.extend(idxs.tolist())
+            sc_train_indices.extend(idxs.tolist())
+            continue
+
+        fold_sz = max(n // n_folds, 1)
+        v_start = fold * fold_sz
+        v_end = v_start + fold_sz if fold < n_folds - 1 else n
+
+        if v_start >= n:
+            sc_val_indices.append(idxs[-1])
+            sc_train_indices.extend(idxs.tolist())
+            continue
+
+        v_end = min(v_end, n)
+        sc_val_indices.extend(idxs[v_start:v_end].tolist())
+        sc_train_indices.extend(np.concatenate([idxs[:v_start], idxs[v_end:]]).tolist())
+
+    sc_train_gt = Subset(soundscape_ds_gt, sc_train_indices)
+    sc_val = Subset(soundscape_ds_val, sc_val_indices)
+
+    # Add pseudo-labeled soundscape segments to training only
+    if pseudo_labels_csv and os.path.isfile(pseudo_labels_csv):
+        pseudo_ds = SoundscapeDataset(
+            pseudo_labels_csv, soundscape_dir, label_map,
+            sample_rate=sample_rate, clip_duration=clip_duration,
+            label_smoothing=label_smoothing,
+        )
+        sc_train = ConcatDataset([sc_train_gt, pseudo_ds])
+        logger.info(f"Pseudo-labels: {len(pseudo_ds)} segments added to soundscape training")
+    else:
+        sc_train = sc_train_gt
 
     # --- Combine ---
     # Train = mixed train_audio (train fold) + soundscape (train fold)
@@ -471,8 +531,9 @@ def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
     split_info = {
         "audio_ds": audio_ds_full,
         "audio_train_idx": audio_train_idx,
-        "soundscape_ds": soundscape_ds_train,
-        "sc_train_indices": sc_train_indices.tolist(),
+        "soundscape_ds_gt": soundscape_ds_gt,
+        "sc_train_indices": sc_train_indices,
+        "pseudo_ds": pseudo_ds if (pseudo_labels_csv and os.path.isfile(pseudo_labels_csv)) else None,
     }
 
     return train_ds, val_ds, label_map, num_classes, n_train_audio, len(sc_train), split_info
@@ -540,7 +601,8 @@ def get_dataloaders(data_dir, batch_size=32, num_workers=4, sample_rate=32000,
                     clip_duration=10.0, val_frac=0.25, seed=42,
                     label_smoothing=0.0,
                     n_folds=5, fold=0, multi_mix=True, mix_prob=0.7,
-                    preload=False, valid_regions_path=None):
+                    preload=False, valid_regions_path=None,
+                    pseudo_labels_csv=None):
     """
     Convenience function returning DataLoaders ready for training.
 
@@ -551,6 +613,7 @@ def get_dataloaders(data_dir, batch_size=32, num_workers=4, sample_rate=32000,
         val_frac=val_frac, seed=seed, label_smoothing=label_smoothing,
         n_folds=n_folds, fold=fold, multi_mix=multi_mix, mix_prob=mix_prob,
         preload=preload, valid_regions_path=valid_regions_path,
+        pseudo_labels_csv=pseudo_labels_csv,
     )
 
     sampler = _build_class_balanced_sampler(

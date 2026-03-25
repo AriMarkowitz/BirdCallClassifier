@@ -75,23 +75,34 @@ if [ ! -f "$VALID_REGIONS" ]; then
         --output "$VALID_REGIONS"
 fi
 
-# ── Fold and seed (override via environment: FOLD=2 sbatch train.sh) ──
+# ── Fold, seed, and resume (override via environment) ──
+# Examples:
+#   FOLD=2 sbatch scripts/train.sh
+#   RESUME_FROM=checkpoints/313603_fold0/birdclef-htsat-epoch=05-val_macro_auc=0.8500.ckpt sbatch scripts/train.sh
 FOLD="${FOLD:-0}"
 SEED="${SEED:-42}"
+RESUME_FROM="${RESUME_FROM:-}"
 
 # ── Run training ──
 JOB_ID="${SLURM_JOB_ID:-local_$(date +%Y%m%d_%H%M%S)}"
 RUN_ID="${JOB_ID}_fold${FOLD}"
+
+RESUME_ARG=""
+if [ -n "$RESUME_FROM" ]; then
+    echo "Resuming from checkpoint: $RESUME_FROM"
+    RESUME_ARG="--resume_from $RESUME_FROM"
+fi
 
 python src/train.py \
     --data_dir "$PROJECT_DIR/data" \
     --checkpoint "$CKPT_PATH" \
     --batch_size 128 \
     --num_workers 8 \
-    --max_epochs 12 \
+    --max_epochs 25 \
     --lr 1e-4 \
     --save_dir "$CKPT_DIR" \
     --seed "$SEED" \
+    --loss focal \
     --label_smoothing 0.1 \
     --n_folds 5 \
     --fold "$FOLD" \
@@ -99,6 +110,7 @@ python src/train.py \
     --wandb_project birdclef-2026 \
     --run_name "htsat-${RUN_ID}" \
     --run_id "$RUN_ID" \
-    --valid_regions "$VALID_REGIONS"
+    --valid_regions "$VALID_REGIONS" \
+    $RESUME_ARG
 
 echo "Training complete (run=$RUN_ID, fold=$FOLD)."
