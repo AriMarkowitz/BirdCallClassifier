@@ -9,10 +9,11 @@
 - [x] Secondary labels in train_audio (multi-hot targets)
 - [x] Label smoothing (ε=0.1)
 - [x] All taxonomy classes trained (birds, insects, amphibians, mammals, reptiles)
+- [x] NMF latent feature integration into HTSAT forward pass (global dictionary W_k56, nmf_proj head)
 - [x] Two-stage temporal fusion (implemented but made Kaggle score worse — temporal MLP overfits on 1183 soundscape samples, deprioritized)
 
 ## Key problem: domain shift
-Val AUC is 0.999 but Kaggle score is 0.848. The model memorizes clean focal recordings from train_audio but cannot generalize to noisy, polyphonic test soundscapes. Past BirdCLEF winners confirm this is THE problem to solve. Everything below is ordered by expected impact on closing this gap.
+Val AUC was 0.999 but Kaggle score is 0.848. The inflated val AUC was because validation only used soundscape segments (most species absent → trivially high AUC). **Fixed:** validation now includes a stratified holdout of train_audio + soundscape fold, so val AUC reflects all species. The model memorizes clean focal recordings but cannot generalize to noisy, polyphonic test soundscapes. Past BirdCLEF winners confirm this is THE problem to solve. Everything below is ordered by expected impact on closing this gap.
 
 ---
 
@@ -21,10 +22,10 @@ Val AUC is 0.999 but Kaggle score is 0.848. The model memorizes clean focal reco
 ### 1. Noise-robust training with strong augmentation
 The model trains on clean single-species focal recordings but tests on noisy multi-species soundscapes. Augmentation bridges this domain gap.
 
-- [ ] **Multi-species mixing** — randomly overlay 3-5 train_audio clips at varying volumes per sample. Union their multi-hot labels. Teaches the model to detect individual species in polyphonic audio. This is the competition-specific version of MixUp that past winners used.
-- [ ] **MixUp / Sumix** — test label-aware waveform or spectrogram mixing beyond simple overlay. Compare classic MixUp against Sumix-style stronger sample mixing to improve robustness on overlapping species and noisy backgrounds.
+- [x] **Multi-species mixing** — implemented as `MultiSpeciesMixDataset` in dataset.py. Overlays 1-4 random train_audio clips at gains 0.1-0.7 with probability 0.7 per sample. Union of multi-hot labels. Enabled by default (`--multi_mix`, `--mix_prob 0.7`).
+- [x] **MixUp / SuMix** — implemented as batch-level SuMix in train.py `_sumix()`. Shuffles batch and additively mixes waveforms with Beta-distributed lambda, soft-union labels. Enabled by default (`--mixup_alpha 0.4`).
 - [ ] **Soundscape background injection** — mix a random crop from the 10,593 unlabeled soundscape files as background noise behind clean train_audio clips. This is the most realistic noise source possible — same equipment, same sites, same ambient conditions as test data. ~5GB of free noise available in `data/train_soundscapes/`.
-- [ ] **SpecAugment (aggressive)** — increase frequency/time masking beyond current defaults. Force model to be robust to partial information.
+- [x] **SpecAugment** — HTSAT already applies SpecAugmentation (time_drop_width=64, time_stripes_num=2, freq_drop_width=8, freq_stripes_num=2) during training. Built into the backbone.
 - [ ] **FilterAugment** — apply random band-wise spectral shaping / filtering to mimic microphone, habitat, and distance variation. Useful for domain robustness without changing labels.
 - [ ] **Time shift** — randomly roll or offset clips within the 5s window so detections are less position-dependent. Cheap augmentation and also useful to mirror test-time offset variability.
 - [ ] **Pitch shift (light)** — small semitone perturbations only (e.g. ±0.5 to ±1.0 semitones) to improve robustness while avoiding unrealistic bird vocal transformations.
@@ -39,8 +40,8 @@ Only 66 of 10,658 soundscape files have labels (1,478 segments). The other 10,59
 - [ ] **Pseudo-label filtering** — track prediction confidence across rounds. Remove samples where the model flip-flops (unstable predictions). Weight pseudo-labeled samples lower than ground-truth labeled samples in the loss.
 
 ### 3. Focal loss
-- [ ] **Replace BCELoss with focal loss** — down-weights easy negatives (230+ absent species per segment), focuses gradients on hard positives. Complements pseudo-labeling since pseudo-labels are noisier than ground truth. Drop-in replacement, α=0.25, γ=2.0 as starting point.
-- [ ] **Focal loss ablation** — compare BCE vs focal loss under the current Bird-MAE setup, especially once stronger augmentation is enabled. Check whether focal improves rare/quiet species recall without destabilizing calibration.
+- [x] **Replace BCELoss with focal loss** — implemented as `--loss focal` flag in train.py. Down-weights easy negatives (230+ absent species per segment), focuses gradients on hard positives. Default α=0.25, γ=2.0.
+- [ ] **Focal loss ablation** — compare BCE vs focal loss under the current HTSAT+NMF setup, especially once stronger augmentation is enabled. Check whether focal improves rare/quiet species recall without destabilizing calibration.
 
 ### 4. Per-label error analysis + class imbalance audit
 - [ ] **Best / worst label analysis** — compute per-class metrics (AUC, AP, recall at fixed precision, calibration) and rank labels from easiest to hardest. Break this out separately for birds, insects, amphibians, etc.
@@ -48,8 +49,8 @@ Only 66 of 10,658 soundscape files have labels (1,478 segments). The other 10,59
 - [ ] **Confusion and co-occurrence review** — inspect which labels are commonly over-predicted, under-predicted, or confused with acoustically similar species / taxa. Use this to guide augmentation, thresholding, and targeted data collection.
 - [ ] **Rare-label validation slice** — maintain a reporting view focused on low-resource classes so leaderboard improvements are not driven only by already-common species.
 
-### 5. Bird-MAE-Base backbone replacement
-- [ ] **Replace HTSAT with Bird-MAE-Base** — self-supervised ViT-B/16 (85M params, 768-dim embeddings) pretrained via masked autoencoder on BirdSet's 9.7k species ([model](https://huggingface.co/DBD-research-group/Bird-MAE-Base)). Bird-specific representations should outperform AudioSet-general HTSAT for fine-grained species discrimination. Requires new spectrogram pipeline (HuggingFace feature extractor), new model wrapper, new inference notebook. Must bundle custom model code in Kaggle dataset upload (`trust_remote_code=True`). **Prototype on separate branch.** ~2.5x larger than HTSAT-tiny — need to verify it fits in Kaggle's 90-min CPU inference window.
+### 5. Bird-MAE-Base backbone (deprioritized)
+- [ ] **Replace HTSAT with Bird-MAE-Base** — self-supervised ViT-B/16 (85M params, 768-dim embeddings) pretrained via masked autoencoder on BirdSet's 9.7k species ([model](https://huggingface.co/DBD-research-group/Bird-MAE-Base)). Potentially better representations but ~2.5x larger than HTSAT-tiny. Previously prototyped on `bird-mae-backbone` branch but deprioritized in favor of HTSAT+NMF approach. Would need to verify it fits in Kaggle's 90-min CPU inference window.
 
 ---
 
@@ -69,18 +70,16 @@ Only 66 of 10,658 soundscape files have labels (1,478 segments). The other 10,59
 - [ ] **Hybrid sampling scheme** — keep some natural-frequency batches for calibration while reserving part of each epoch for rare-label upsampling. Goal: reduce imbalance without making the train distribution too unrealistic.
 - [ ] **Taxon-aware sampling** — ensure insects / amphibians / mammals / reptiles are not drowned out by abundant bird labels when constructing batches.
 
-### 9. Global NMF latent basis + learned projection
-Build a fixed global latent dictionary from representative spectrogram data, then train a small CNN to project any clip into that latent space at inference time.
+### 9. NMF latent basis — next steps
+Steps 1-2 are done: global dictionary W (k=56) learned via NMFk, and per-clip projection integrated directly into HTSAT forward pass (multiplicative updates solver + nmf_proj linear head). Remaining work:
 
-**Why this architecture:** Running NMFk per clip is both expensive and semantically wrong — without a shared dictionary, each clip's latent dimensions represent different spectral patterns, so component 3 in one clip (e.g. insect drone) has no relation to component 3 in another (e.g. wind). A global W gives every component a fixed meaning across all clips ("component 12 always captures this frequency pattern"), making the activations H comparable and useful as features. However, we can't run NMFk on the entire concatenated training audio — it's too large. So we learn W from a representative subsample, generate per-clip H targets with W fixed (cheap NNLS solve, not full NMFk), then train a CNN to predict those targets directly from spectrograms. At inference time, only the CNN runs — no NMF at all.
-
-- [ ] **Step 1: Learn global dictionary W** — take a large representative sample of training soundscapes, convert to nonneg representation (mel or PCEN spectrograms), concatenate enough time for NMFk to see broad backgrounds + bird calls. Run NMFk once on that pooled matrix to choose k and learn W ∈ R+^{f×k}. Output: fixed preprocessing params (sr, FFT, hop, mel bins, normalization) and fixed global dictionary W.
-- [ ] **Step 2: Project clips into fixed basis** — for each 5s clip, compute the same spectrogram and solve only for activation matrix H in V ≈ WH with W fixed (no per-clip NMFk). Extract fixed-size latent features from H: mean, max, std over time per component; sparsity; top temporal peaks per component. One latent feature vector per clip.
-- [ ] **Step 3: Train small CNN encoder to approximate latent features** — train a small CNN (not MLP — input has time-frequency structure) to predict the NMF latent summary vector from Step 2 directly from the clip spectrogram. Target is the NMF latent vector, not the class label. This replaces the per-clip NNLS solve with a fast learned forward pass at inference time.
+- [x] **Step 1: Learn global dictionary W** — done. W_k56.npy in `nmf_analysis/output/`, learned from representative soundscape spectrograms via NMFk.
+- [x] **Step 2: Project clips into fixed basis** — done. Integrated into HTSAT forward pass: power mel spectrogram → solve H via multiplicative updates (W fixed) → mean+max summary → nmf_proj linear layer → added to classification logits.
+- [ ] **Step 3: Train small CNN encoder to approximate latent features** — train a small CNN (not MLP — input has time-frequency structure) to predict the NMF latent summary vector from Step 2 directly from the clip spectrogram. Target is the NMF latent vector, not the class label. This replaces the per-clip multiplicative updates solve with a fast learned forward pass at inference time.
 - [ ] **Step 4: Fuse latent branch with main classifier** — two options to evaluate:
-  - **Option A: Feature concatenation** — concatenate (a) learned deep features from main backbone and (b) CNN-predicted NMF latent features before the classification head. NMF branch stays fully independent of Bird-MAE — easy to train, debug, and ablate separately. Adds minor inference cost (MobileNetV3-Small side branch).
-  - **Option B: Auxiliary loss (no inference cost)** — add a second head to Bird-MAE that predicts the NMF latent vector as a regularization signal during training, then discard that head at inference. Pushes Bird-MAE's internal representations to capture spectral structure NMF finds, without adding any inference cost. More exotic — try Option A first.
-- [ ] **Step 5: Ablation ladder** — test in order: (1) baseline, (2) baseline + exact NMF features, (3) baseline + CNN-predicted latent features, (4) optionally both. Judge by val performance and robustness on noisy soundscapes. Stop early if no improvement.
+  - **Option A: Feature concatenation** — concatenate (a) learned deep features from HTSAT backbone and (b) CNN-predicted NMF latent features before the classification head. NMF branch stays fully independent — easy to train, debug, and ablate separately. Adds minor inference cost (MobileNetV3-Small side branch).
+  - **Option B: Auxiliary loss (no inference cost)** — add a second head to HTSAT that predicts the NMF latent vector as a regularization signal during training, then discard that head at inference. Pushes HTSAT's internal representations to capture spectral structure NMF finds, without adding any inference cost. More exotic — try Option A first.
+- [ ] **Step 5: Ablation ladder** — test in order: (1) baseline, (2) baseline + exact NMF features (current), (3) baseline + CNN-predicted latent features, (4) optionally both. Judge by val performance and robustness on noisy soundscapes. Stop early if no improvement.
 
 ### 10. Post-processing
 - [ ] **Threshold tuning** — optimize per-class thresholds on validation set instead of using 0.5 cutoff. Quick win, no retraining.

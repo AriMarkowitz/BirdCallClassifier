@@ -53,6 +53,7 @@ assert MODEL_DATASET, f"Model dataset not found. /kaggle/input contains: {os.lis
 CHECKPOINT_PATHS = sorted(glob.glob(os.path.join(MODEL_DATASET, "birdclef-htsat-*.ckpt")))
 
 HTSAT_CODE_DIR = os.path.join(MODEL_DATASET, "htsat")
+NMF_W_PATH = os.path.join(MODEL_DATASET, "W_k56.npy")
 TAXONOMY_PATH = os.path.join(COMPETITION_DATA, "taxonomy.csv")
 
 print(f"Competition data: {COMPETITION_DATA}")
@@ -61,10 +62,12 @@ print(f"Checkpoints found: {len(CHECKPOINT_PATHS)}")
 for cp in CHECKPOINT_PATHS:
     print(f"  - {os.path.basename(cp)}")
 print(f"HTSAT code: {HTSAT_CODE_DIR}")
+print(f"NMF W matrix: {NMF_W_PATH}")
 print(f"Taxonomy: {TAXONOMY_PATH}")
 
 assert len(CHECKPOINT_PATHS) > 0, "No checkpoints found"
 assert os.path.isdir(HTSAT_CODE_DIR), f"HTSAT code dir not found: {HTSAT_CODE_DIR}"
+assert os.path.isfile(NMF_W_PATH), f"NMF W matrix not found: {NMF_W_PATH}"
 assert os.path.isfile(TAXONOMY_PATH), f"Taxonomy not found: {TAXONOMY_PATH}"
 
 TEST_SOUNDSCAPES = os.path.join(COMPETITION_DATA, "test_soundscapes")
@@ -89,6 +92,79 @@ for mod_name in ["h5py", "museval", "museval.metrics", "torchcontrib", "torchcon
     if mod_name not in sys.modules:
         sys.modules[mod_name] = types.ModuleType(mod_name)
 sys.modules["torchcontrib.optim"].SWA = type("SWA", (), {})
+
+# torchlibrosa shim: Kaggle doesn't have torchlibrosa, so we provide
+# lightweight replacements using torchaudio (which IS available).
+import torchaudio
+import torchaudio.transforms as _T
+
+class _Spectrogram(nn.Module):
+    """Drop-in replacement for torchlibrosa.stft.Spectrogram.
+    torchlibrosa returns (B, 1, time_steps, freq_bins)."""
+    def __init__(self, n_fft=2048, hop_length=None, win_length=None,
+                 window='hann', center=True, pad_mode='reflect',
+                 power=2.0, freeze_parameters=True):
+        super().__init__()
+        self.spec = _T.Spectrogram(
+            n_fft=n_fft, hop_length=hop_length, win_length=win_length,
+            power=power, center=center, pad_mode=pad_mode,
+        )
+    def forward(self, x):
+        # x: (B, 1, samples) or (B, samples)
+        if x.dim() == 3:
+            out = self.spec(x[:, 0])        # (B, freq, time)
+        else:
+            out = self.spec(x)              # (B, freq, time)
+        # Transpose to match torchlibrosa layout: (B, 1, time, freq)
+        return out.transpose(1, 2).unsqueeze(1)
+
+class _LogmelFilterBank(nn.Module):
+    """Drop-in replacement for torchlibrosa.stft.LogmelFilterBank.
+    Input/output layout: (B, 1, time_steps, freq/mel_bins)."""
+    def __init__(self, sr=22050, n_fft=2048, n_mels=64, fmin=0.0, fmax=None,
+                 is_log=True, ref=1.0, amin=1e-10, top_db=None,
+                 freeze_parameters=True):
+        super().__init__()
+        self.mel_scale = _T.MelScale(
+            n_mels=n_mels, sample_rate=sr, n_stft=n_fft // 2 + 1,
+            f_min=fmin, f_max=fmax, norm="slaney", mel_scale="htk",
+        )
+        self.is_log = is_log
+        self.ref = ref
+        self.amin = amin
+        self.top_db = top_db
+    def forward(self, x):
+        # x: (B, 1, time, freq) -> transpose to (B, 1, freq, time) for MelScale
+        x_ft = x.transpose(2, 3)           # (B, 1, freq, time)
+        mel = self.mel_scale(x_ft)          # (B, 1, mel, time)
+        if self.is_log:
+            mel = torch.log10(torch.clamp(mel, min=self.amin) / self.ref)
+            mel = mel * 10.0
+            if self.top_db is not None:
+                mel = torch.clamp(mel, min=mel.max() - self.top_db)
+        # Transpose back to (B, 1, time, mel)
+        return mel.transpose(2, 3)
+
+class _SpecAugmentation(nn.Module):
+    """No-op replacement for torchlibrosa.augmentation.SpecAugmentation.
+    Not needed at inference time."""
+    def __init__(self, **kwargs):
+        super().__init__()
+    def forward(self, x):
+        return x
+
+# Inject into sys.modules so `from torchlibrosa.stft import ...` works
+_tl = types.ModuleType("torchlibrosa")
+_tl_stft = types.ModuleType("torchlibrosa.stft")
+_tl_aug = types.ModuleType("torchlibrosa.augmentation")
+_tl_stft.Spectrogram = _Spectrogram
+_tl_stft.LogmelFilterBank = _LogmelFilterBank
+_tl_aug.SpecAugmentation = _SpecAugmentation
+_tl.stft = _tl_stft
+_tl.augmentation = _tl_aug
+sys.modules["torchlibrosa"] = _tl
+sys.modules["torchlibrosa.stft"] = _tl_stft
+sys.modules["torchlibrosa.augmentation"] = _tl_aug
 
 # Fix numpy 2.x: sed_model.py does `from numpy.lib.function_base import average`
 try:
@@ -199,6 +275,7 @@ def load_model(checkpoint_path):
         num_heads=htsat_config.htsat_num_head,
         window_size=htsat_config.htsat_window_size,
         config=htsat_config,
+        W_path=NMF_W_PATH,
     )
 
     temporal_mlp = TemporalMLP(TEMPORAL_DIM, NUM_CLASSES)
@@ -210,7 +287,10 @@ def load_model(checkpoint_path):
     htsat_dict = {k.replace("sed_model.", ""): v
                   for k, v in state_dict.items()
                   if k.startswith("sed_model.")}
-    model.load_state_dict(htsat_dict, strict=True)
+    # strict=False: the torchlibrosa shim registers different buffer names
+    # (e.g. spec.window vs stft.conv_real) — these are frozen spectrogram
+    # params, not learned weights, so mismatches are harmless.
+    model.load_state_dict(htsat_dict, strict=False)
     model.eval()
 
     # Load temporal MLP weights if present

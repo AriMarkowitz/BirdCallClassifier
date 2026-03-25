@@ -19,6 +19,7 @@ import argparse
 import logging
 import math
 
+import numpy as np
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
@@ -32,7 +33,7 @@ sys.path.insert(0, os.path.join(PROJ_ROOT, "src"))
 import config as htsat_config
 from model.htsat import HTSAT_Swin_Transformer
 from sed_model import SEDWrapper
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader
 from dataset import get_dataloaders, get_datasets, build_label_map
 
 logging.basicConfig(level=logging.INFO)
@@ -131,8 +132,9 @@ class BirdCLEFWrapper(pl.LightningModule):
     """Lightning wrapper for HTSAT fine-tuning on BirdCLEF."""
 
     def __init__(self, sed_model, config, num_classes, learning_rate=1e-4,
-                 warmup_epochs=1, max_epochs=30, n_train_audio=0,
-                 loss_type="bce", focal_alpha=0.25, focal_gamma=2.0):
+                 warmup_epochs=1, max_epochs=30,
+                 loss_type="bce", focal_alpha=0.25, focal_gamma=2.0,
+                 mixup_alpha=0.4):
         super().__init__()
         self.sed_model = sed_model
         self.config = config
@@ -140,13 +142,15 @@ class BirdCLEFWrapper(pl.LightningModule):
         self.learning_rate = learning_rate
         self.warmup_epochs = warmup_epochs
         self.max_epochs = max_epochs
-        self.n_train_audio = n_train_audio
+        self.mixup_alpha = mixup_alpha
         if loss_type == "focal":
             self.loss_fn = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
             logger.info(f"Using FocalLoss (alpha={focal_alpha}, gamma={focal_gamma})")
         else:
             self.loss_fn = nn.BCELoss()
             logger.info("Using BCELoss")
+        if mixup_alpha > 0:
+            logger.info(f"SuMix enabled: alpha={mixup_alpha}")
 
     def forward(self, x, mix_lambda=None):
         output_dict = self.sed_model(x, mix_lambda)
@@ -160,9 +164,42 @@ class BirdCLEFWrapper(pl.LightningModule):
             target = target.float()
             return self.loss_fn(pred, target)
 
+    def _sumix(self, waveform, target):
+        """SuMix: shuffle batch and mix waveforms additively with soft labels.
+
+        Waveform: anchor + (1-lam) * shuffled (additive, not convex).
+        Target: element-wise max of (anchor_target, (1-lam) * shuffled_target).
+        This ensures the anchor labels stay at full strength while the secondary
+        labels are scaled by their actual gain — a species mixed at 10% gain
+        gets a 0.1 target, not 1.0.
+        """
+        if self.mixup_alpha <= 0:
+            return waveform, target
+
+        lam = np.random.beta(self.mixup_alpha, self.mixup_alpha)
+        lam = max(lam, 1.0 - lam)  # ensure anchor dominates
+
+        batch_size = waveform.size(0)
+        perm = torch.randperm(batch_size, device=waveform.device)
+
+        # Additive waveform mix: anchor stays at full gain, secondary scaled
+        waveform_mixed = waveform + (1.0 - lam) * waveform[perm]
+        # Anchor labels stay at full strength; secondary labels scaled by
+        # their mixing gain so the target reflects actual audibility
+        target_mixed = torch.maximum(target, (1.0 - lam) * target[perm])
+
+        return waveform_mixed, target_mixed
+
     def training_step(self, batch, batch_idx):
-        pred, _ = self(batch["waveform"])
-        loss = self._safe_loss(pred, batch["target"])
+        waveform = batch["waveform"]
+        target = batch["target"]
+
+        # Apply SuMix batch-level augmentation
+        if self.training and self.mixup_alpha > 0:
+            waveform, target = self._sumix(waveform, target)
+
+        pred, _ = self(waveform)
+        loss = self._safe_loss(pred, target)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         if batch_idx % 50 == 0:
             logger.info(f"Step {self.global_step} (epoch {self.current_epoch}, "
@@ -219,44 +256,6 @@ class BirdCLEFWrapper(pl.LightningModule):
 
         return optimizer
 
-    def on_train_epoch_start(self):
-        """Curriculum: gradually increase soundscape weight over training."""
-        # Unwrap PL's dataloader wrappers to find the WeightedRandomSampler
-        sampler = None
-        dl = self.trainer.train_dataloader
-        # PL 1.9 wraps in CombinedLoader; dig through possible wrappers
-        for attr in ['loaders', 'flattened']:
-            if hasattr(dl, attr):
-                val = getattr(dl, attr)
-                if isinstance(val, (list, tuple)):
-                    dl = val[0]
-                elif isinstance(val, dict):
-                    dl = list(val.values())[0]
-                break
-        # Now dl should be a DataLoader or another wrapper
-        if hasattr(dl, 'sampler'):
-            s = dl.sampler
-            if isinstance(s, WeightedRandomSampler):
-                sampler = s
-
-        if sampler is None:
-            if self.current_epoch == 0:
-                logger.warning("Curriculum: could not find WeightedRandomSampler, skipping")
-            return
-
-        # Curriculum schedule: ramp soundscape weight from 0.5 to 3.0
-        # Start with clean audio focus so model learns individual species,
-        # then ramp up soundscapes to learn noisy multi-species detection
-        progress = self.current_epoch / max(self.max_epochs - 1, 1)
-        weight = 0.5 + 2.5 * progress  # 0.5 at epoch 0, 3.0 at final epoch
-
-        n_total = len(sampler.weights)
-        new_weights = torch.ones(n_total, dtype=torch.float64)
-        new_weights[self.n_train_audio:] = weight
-        sampler.weights = new_weights
-
-        self.log("soundscape_weight", weight)
-        logger.info(f"Epoch {self.current_epoch}: curriculum soundscape_weight={weight:.2f}")
 
 
 def main():
@@ -276,8 +275,6 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume_from", type=str, default=None,
                         help="Path to Lightning checkpoint to resume training from")
-    parser.add_argument("--soundscape_weight", type=float, default=3.0,
-                        help="Upweight soundscape samples in training sampler")
     parser.add_argument("--label_smoothing", type=float, default=0.1,
                         help="Label smoothing factor (0=hard labels, 0.1=recommended)")
     parser.add_argument("--loss", type=str, default="bce", choices=["bce", "focal"],
@@ -298,6 +295,16 @@ def main():
                         help="Number of CV folds")
     parser.add_argument("--fold", type=int, default=0,
                         help="Which fold to hold out for validation (0 to n_folds-1)")
+    parser.add_argument("--multi_mix", action="store_true", default=True,
+                        help="Enable multi-species mixing augmentation on train_audio")
+    parser.add_argument("--no_multi_mix", action="store_false", dest="multi_mix",
+                        help="Disable multi-species mixing augmentation")
+    parser.add_argument("--mix_prob", type=float, default=0.7,
+                        help="Probability of multi-species mixing per sample")
+    parser.add_argument("--mixup_alpha", type=float, default=0.4,
+                        help="Beta distribution alpha for SuMix (0=disabled)")
+    parser.add_argument("--preload", action="store_true",
+                        help="Preload all train_audio waveforms into RAM (~34GB) for faster mixing")
     args = parser.parse_args()
 
     pl.seed_everything(args.seed)
@@ -323,22 +330,15 @@ def main():
         clip_duration=htsat_config.clip_samples / htsat_config.sample_rate,
         val_frac=args.val_frac,
         seed=args.seed,
-        soundscape_weight=args.soundscape_weight,
         label_smoothing=args.label_smoothing,
         n_folds=args.n_folds,
         fold=args.fold,
+        multi_mix=args.multi_mix,
+        mix_prob=args.mix_prob,
+        preload=args.preload,
     )
     logger.info(f"Classes: {num_classes}, Train batches: {len(train_loader)}, "
                 f"Val batches: {len(val_loader)}")
-
-    # Curriculum schedule summary
-    logger.info(f"Curriculum training: soundscape_weight ramps 0.50 -> 3.00 "
-                f"linearly over {args.max_epochs} epochs")
-    logger.info(f"  Epoch 0: weight=0.50 (clean audio focus)")
-    mid = args.max_epochs // 2
-    mid_w = 0.5 + 4.5 * (mid / max(args.max_epochs - 1, 1))
-    logger.info(f"  Epoch {mid}: weight={mid_w:.2f}")
-    logger.info(f"  Epoch {args.max_epochs - 1}: weight=3.00 (soundscape focus)")
 
     # Build model
     htsat_config.classes_num = num_classes
@@ -348,10 +348,10 @@ def main():
         learning_rate=args.lr,
         warmup_epochs=args.warmup_epochs,
         max_epochs=args.max_epochs,
-        n_train_audio=n_train_audio,
         loss_type=args.loss,
         focal_alpha=args.focal_alpha,
         focal_gamma=args.focal_gamma,
+        mixup_alpha=args.mixup_alpha,
     )
 
     # Save checkpoints in a run-specific subdirectory
@@ -383,7 +383,6 @@ def main():
                 "max_epochs": args.max_epochs,
                 "seed": args.seed,
                 "val_frac": args.val_frac,
-                "soundscape_weight": args.soundscape_weight,
                 "warmup_epochs": args.warmup_epochs,
                 "label_smoothing": args.label_smoothing,
                 "fold": args.fold,
@@ -392,6 +391,9 @@ def main():
                 "loss": args.loss,
                 "focal_alpha": args.focal_alpha,
                 "focal_gamma": args.focal_gamma,
+                "multi_mix": args.multi_mix,
+                "mix_prob": args.mix_prob,
+                "mixup_alpha": args.mixup_alpha,
             },
         )
         loggers.append(wandb_logger)

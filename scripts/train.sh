@@ -83,7 +83,6 @@ python src/train.py \
     --lr 1e-4 \
     --save_dir "$CKPT_DIR" \
     --seed "$SEED" \
-    --soundscape_weight 3.0 \
     --label_smoothing 0.1 \
     --n_folds 5 \
     --fold "$FOLD" \
