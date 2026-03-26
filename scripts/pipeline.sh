@@ -11,9 +11,16 @@
 #SBATCH --error=logs/pipeline_%j.log
 
 # ── Pseudo-labeling pipeline ──
-# Round 1: Train from scratch (or resume)
-# Round 2: Pseudo-label unlabeled soundscapes with round-1 checkpoint
-# Round 3: Retrain with pseudo-labels added to training data
+#
+# Usage:
+#   # Pseudo-label from existing checkpoint, then retrain:
+#   CKPT=checkpoints/313637_fold0/birdclef-htsat-epoch=21-val_macro_auc=0.9557.ckpt sbatch scripts/pipeline.sh
+#
+#   # Full pipeline (train from scratch → pseudo-label → retrain):
+#   sbatch scripts/pipeline.sh
+#
+#   # Customize threshold/fold:
+#   CKPT=path/to/best.ckpt THRESHOLD=0.7 FOLD=2 sbatch scripts/pipeline.sh
 
 PROJECT_DIR="$HOME/BirdCallClassifier"
 ENV_NAME="birdcallclassifier"
@@ -35,14 +42,16 @@ cd "$PROJECT_DIR"
 FOLD="${FOLD:-0}"
 SEED="${SEED:-42}"
 THRESHOLD="${THRESHOLD:-0.8}"
+CKPT="${CKPT:-}"  # path to existing checkpoint; if empty, trains from scratch first
 JOB_ID="${SLURM_JOB_ID:-local_$(date +%Y%m%d_%H%M%S)}"
 
-CKPT_PATH="$CKPT_DIR/HTSAT_AudioSet_Saved_1.ckpt"
+PRETRAINED_PATH="$CKPT_DIR/HTSAT_AudioSet_Saved_1.ckpt"
 VALID_REGIONS="$PROJECT_DIR/data/valid_regions.json"
 PSEUDO_CSV="$PROJECT_DIR/data/pseudo_labels.csv"
 
-echo "=== Pipeline: train → pseudo-label → retrain ==="
+echo "=== Pipeline: pseudo-label → retrain ==="
 echo "Job: $JOB_ID, Fold: $FOLD, Seed: $SEED, Threshold: $THRESHOLD"
+echo "Checkpoint: ${CKPT:-'(will train from scratch first)'}"
 echo "---"
 
 # ── Preprocess: detect active vocal regions (cached) ──
@@ -53,46 +62,49 @@ if [ ! -f "$VALID_REGIONS" ]; then
         --output "$VALID_REGIONS"
 fi
 
-# ── Round 1: Initial training ──
-RUN_ID_R1="${JOB_ID}_fold${FOLD}_r1"
-echo ""
-echo "=== Round 1: Initial training (run=$RUN_ID_R1) ==="
+# ── Step 1: Get a checkpoint (train if none provided) ──
+if [ -z "$CKPT" ]; then
+    RUN_ID_R1="${JOB_ID}_fold${FOLD}_r1"
+    echo ""
+    echo "=== Step 1: Training from scratch (run=$RUN_ID_R1) ==="
 
-python src/train.py \
-    --data_dir "$PROJECT_DIR/data" \
-    --checkpoint "$CKPT_PATH" \
-    --batch_size 128 \
-    --num_workers 8 \
-    --max_epochs 12 \
-    --lr 1e-4 \
-    --save_dir "$CKPT_DIR" \
-    --seed "$SEED" \
-    --loss focal \
-    --label_smoothing 0.1 \
-    --n_folds 5 \
-    --fold "$FOLD" \
-    --use_wandb \
-    --wandb_project birdclef-2026 \
-    --run_name "htsat-${RUN_ID_R1}" \
-    --run_id "$RUN_ID_R1" \
-    --valid_regions "$VALID_REGIONS"
+    python src/train.py \
+        --data_dir "$PROJECT_DIR/data" \
+        --checkpoint "$PRETRAINED_PATH" \
+        --batch_size 128 \
+        --num_workers 8 \
+        --max_epochs 25 \
+        --lr 1e-4 \
+        --save_dir "$CKPT_DIR" \
+        --seed "$SEED" \
+        --loss focal \
+        --label_smoothing 0.1 \
+        --n_folds 5 \
+        --fold "$FOLD" \
+        --use_wandb \
+        --wandb_project birdclef-2026 \
+        --run_name "htsat-${RUN_ID_R1}" \
+        --run_id "$RUN_ID_R1" \
+        --valid_regions "$VALID_REGIONS"
 
-echo "Round 1 complete."
-
-# ── Find best checkpoint from round 1 ──
-R1_BEST=$(ls -t "$CKPT_DIR/$RUN_ID_R1"/birdclef-htsat-*.ckpt 2>/dev/null | head -1)
-if [ -z "$R1_BEST" ]; then
-    echo "ERROR: No round-1 checkpoint found in $CKPT_DIR/$RUN_ID_R1/"
-    exit 1
+    # Find best checkpoint from round 1
+    CKPT=$(ls -t "$CKPT_DIR/$RUN_ID_R1"/birdclef-htsat-*.ckpt 2>/dev/null | head -1)
+    if [ -z "$CKPT" ]; then
+        echo "ERROR: No checkpoint found in $CKPT_DIR/$RUN_ID_R1/"
+        exit 1
+    fi
+    echo "Round 1 complete. Best checkpoint: $CKPT"
+else
+    echo ""
+    echo "=== Step 1: Using provided checkpoint: $CKPT ==="
 fi
-echo "Best round-1 checkpoint: $R1_BEST"
 
-# ── Pseudo-labeling ──
+# ── Step 2: Pseudo-label ──
 echo ""
-echo "=== Pseudo-labeling unlabeled soundscapes (threshold=$THRESHOLD) ==="
+echo "=== Step 2: Pseudo-labeling (threshold=$THRESHOLD) ==="
 
 python scripts/pseudo_label.py \
-    --checkpoint "$R1_BEST" \
+    --checkpoint "$CKPT" \
     --data-dir "$PROJECT_DIR/data" \
     --output "$PSEUDO_CSV" \
     --threshold "$THRESHOLD" \
@@ -105,21 +117,21 @@ N_PSEUDO=$(tail -n +2 "$PSEUDO_CSV" 2>/dev/null | wc -l)
 echo "Pseudo-labeled segments: $N_PSEUDO"
 
 if [ "$N_PSEUDO" -eq 0 ]; then
-    echo "WARNING: No pseudo-labels generated. Skipping round 2."
+    echo "WARNING: No pseudo-labels generated. Skipping retrain."
     exit 0
 fi
 
-# ── Round 2: Retrain with pseudo-labels ──
+# ── Step 3: Retrain with pseudo-labels ──
 RUN_ID_R2="${JOB_ID}_fold${FOLD}_r2"
 echo ""
-echo "=== Round 2: Retraining with pseudo-labels (run=$RUN_ID_R2) ==="
+echo "=== Step 3: Retraining with pseudo-labels (run=$RUN_ID_R2) ==="
 
 python src/train.py \
     --data_dir "$PROJECT_DIR/data" \
-    --checkpoint "$CKPT_PATH" \
+    --checkpoint "$PRETRAINED_PATH" \
     --batch_size 128 \
     --num_workers 8 \
-    --max_epochs 12 \
+    --max_epochs 25 \
     --lr 1e-4 \
     --save_dir "$CKPT_DIR" \
     --seed "$SEED" \
@@ -136,6 +148,6 @@ python src/train.py \
 
 echo ""
 echo "=== Pipeline complete ==="
-echo "Round 1 checkpoint: $R1_BEST"
+echo "Source checkpoint: $CKPT"
 echo "Pseudo-labels: $PSEUDO_CSV ($N_PSEUDO segments)"
-echo "Round 2 checkpoints: $CKPT_DIR/$RUN_ID_R2/"
+echo "Retrained checkpoints: $CKPT_DIR/$RUN_ID_R2/"

@@ -377,6 +377,8 @@ def main():
                         help="Path to valid_regions.json from preprocess_activity.py")
     parser.add_argument("--pseudo_labels", type=str, default=None,
                         help="Path to pseudo_labels.csv from pseudo_label.py")
+    parser.add_argument("--balance_alpha", type=float, default=0.5,
+                        help="Class-balance strength: 0=uniform, 0.5=sqrt(inv-freq), 1=full inv-freq")
     args = parser.parse_args()
 
     pl.seed_everything(args.seed)
@@ -410,6 +412,7 @@ def main():
         preload=args.preload,
         valid_regions_path=args.valid_regions,
         pseudo_labels_csv=args.pseudo_labels,
+        balance_alpha=args.balance_alpha,
     )
     logger.info(f"Classes: {num_classes}, Train batches: {len(train_loader)}, "
                 f"Val batches: {len(val_loader)}")
@@ -471,6 +474,7 @@ def main():
                 "mix_prob": args.mix_prob,
                 "mixup_alpha": args.mixup_alpha,
                 "pseudo_labels": args.pseudo_labels,
+                "balance_alpha": args.balance_alpha,
                 "n_train_audio": n_train_audio,
                 **_load_pseudo_label_summary(args.pseudo_labels),
             },
@@ -487,6 +491,7 @@ def main():
         log_every_n_steps=50,
         precision=32,
         enable_progress_bar=False,
+        num_sanity_val_steps=0,  # skip partial sanity check (misleading AUC on subset)
     )
 
     trainer.fit(wrapper, train_loader, val_loader, ckpt_path=args.resume_from)

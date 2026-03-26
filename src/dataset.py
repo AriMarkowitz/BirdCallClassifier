@@ -221,7 +221,7 @@ class MultiSpeciesMixDataset(Dataset):
     recordings and noisy multi-species test soundscapes.
     """
 
-    def __init__(self, base_dataset, min_mix=1, max_mix=4, mix_prob=0.7,
+    def __init__(self, base_dataset, min_mix=1, max_mix=2, mix_prob=0.3,
                  gain_range=(0.1, 0.7)):
         self.base = base_dataset
         self.min_mix = min_mix
@@ -444,7 +444,7 @@ def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
     # Wrap train audio in multi-species mixing
     if multi_mix:
         audio_train_mixed = MultiSpeciesMixDataset(
-            audio_train_sub, min_mix=1, max_mix=4, mix_prob=mix_prob,
+            audio_train_sub, min_mix=1, max_mix=2, mix_prob=mix_prob,
         )
         logger.info(f"Multi-species mixing enabled: prob={mix_prob}, 1-4 extra clips per sample")
     else:
@@ -503,15 +503,50 @@ def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
     sc_train_gt = Subset(soundscape_ds_gt, sc_train_indices)
     sc_val = Subset(soundscape_ds_val, sc_val_indices)
 
-    # Add pseudo-labeled soundscape segments to training only
+    # Add pseudo-labeled segments to training only.
+    # The pseudo-label CSV may contain entries from both train_soundscapes/
+    # and train_audio/ (secondary species discoveries). Split by checking
+    # which directory the file lives in.
+    pseudo_ds = None
     if pseudo_labels_csv and os.path.isfile(pseudo_labels_csv):
-        pseudo_ds = SoundscapeDataset(
-            pseudo_labels_csv, soundscape_dir, label_map,
-            sample_rate=sample_rate, clip_duration=clip_duration,
-            label_smoothing=label_smoothing,
-        )
-        sc_train = ConcatDataset([sc_train_gt, pseudo_ds])
-        logger.info(f"Pseudo-labels: {len(pseudo_ds)} segments added to soundscape training")
+        pseudo_df = pd.read_csv(pseudo_labels_csv)
+        # Entries with "/" in filename are from train_audio (e.g. "species/file.ogg")
+        sc_mask = ~pseudo_df["filename"].str.contains("/", na=False)
+        audio_mask = pseudo_df["filename"].str.contains("/", na=False)
+
+        pseudo_parts = []
+        if sc_mask.any():
+            sc_pseudo_csv = pseudo_labels_csv.replace(".csv", "_sc.csv") \
+                if isinstance(pseudo_labels_csv, str) \
+                else str(pseudo_labels_csv).replace(".csv", "_sc.csv")
+            pseudo_df[sc_mask].to_csv(sc_pseudo_csv, index=False)
+            sc_pseudo_ds = SoundscapeDataset(
+                sc_pseudo_csv, soundscape_dir, label_map,
+                sample_rate=sample_rate, clip_duration=clip_duration,
+                label_smoothing=label_smoothing,
+            )
+            pseudo_parts.append(sc_pseudo_ds)
+            logger.info(f"Pseudo-labels (soundscape): {len(sc_pseudo_ds)} segments")
+
+        if audio_mask.any():
+            audio_pseudo_csv = pseudo_labels_csv.replace(".csv", "_audio.csv") \
+                if isinstance(pseudo_labels_csv, str) \
+                else str(pseudo_labels_csv).replace(".csv", "_audio.csv")
+            pseudo_df[audio_mask].to_csv(audio_pseudo_csv, index=False)
+            audio_pseudo_ds = SoundscapeDataset(
+                audio_pseudo_csv, audio_dir, label_map,
+                sample_rate=sample_rate, clip_duration=clip_duration,
+                label_smoothing=label_smoothing,
+            )
+            pseudo_parts.append(audio_pseudo_ds)
+            logger.info(f"Pseudo-labels (train_audio secondary): {len(audio_pseudo_ds)} segments")
+
+        if pseudo_parts:
+            pseudo_ds = ConcatDataset(pseudo_parts) if len(pseudo_parts) > 1 else pseudo_parts[0]
+            sc_train = ConcatDataset([sc_train_gt, pseudo_ds])
+            logger.info(f"Pseudo-labels total: {len(pseudo_ds)} segments added to training")
+        else:
+            sc_train = sc_train_gt
     else:
         sc_train = sc_train_gt
 
@@ -533,20 +568,46 @@ def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
         "audio_train_idx": audio_train_idx,
         "soundscape_ds_gt": soundscape_ds_gt,
         "sc_train_indices": sc_train_indices,
-        "pseudo_ds": pseudo_ds if (pseudo_labels_csv and os.path.isfile(pseudo_labels_csv)) else None,
+        "pseudo_ds": pseudo_ds,
     }
 
     return train_ds, val_ds, label_map, num_classes, n_train_audio, len(sc_train), split_info
 
 
-def _build_class_balanced_sampler(audio_ds, audio_train_idx,
-                                  soundscape_ds, sc_train_indices,
-                                  num_classes, n_train_audio):
+def _get_all_entries(ds):
+    """Get all entries from a SoundscapeDataset or ConcatDataset of SoundscapeDatasets."""
+    if ds is None:
+        return []
+    if hasattr(ds, "entries"):
+        return ds.entries
+    if hasattr(ds, "datasets"):
+        entries = []
+        for sub in ds.datasets:
+            entries.extend(_get_all_entries(sub))
+        return entries
+    return []
+
+
+def _build_class_balanced_sampler(split_info, num_classes, n_train_audio, n_sc_train,
+                                  balance_alpha=0.5):
     """Build a WeightedRandomSampler that upweights rare classes.
 
-    Each sample's weight = 1 / freq(rarest positive label in that sample).
-    This ensures every class gets roughly equal representation per epoch.
+    balance_alpha controls how aggressively rare classes are upweighted:
+      0.0 = uniform sampling (natural frequency, no rebalancing)
+      0.5 = sqrt of inverse frequency (moderate boost for rare classes)
+      1.0 = full inverse frequency (every class sampled equally)
+
+    The ConcatDataset layout is:
+      [0 .. n_train_audio-1]  = train audio (mixed)
+      [n_train_audio .. n_train_audio + n_sc_gt_train - 1] = ground-truth soundscapes
+      [n_train_audio + n_sc_gt_train .. end] = pseudo-labeled soundscapes (if any)
     """
+    audio_ds = split_info["audio_ds"]
+    audio_train_idx = split_info["audio_train_idx"]
+    soundscape_ds_gt = split_info["soundscape_ds_gt"]
+    sc_train_indices = split_info["sc_train_indices"]
+    pseudo_ds = split_info.get("pseudo_ds")
+
     # Count class frequencies across all training samples
     class_counts = np.zeros(num_classes, dtype=np.float64)
 
@@ -557,18 +618,28 @@ def _build_class_balanced_sampler(audio_ds, audio_train_idx,
         for sec_idx in audio_ds.secondary_labels[idx]:
             class_counts[sec_idx] += 1
 
-    # Soundscape segments: use label_indices
+    # Ground-truth soundscape segments
     for sc_idx in sc_train_indices:
-        entry = soundscape_ds.entries[sc_idx]
+        entry = soundscape_ds_gt.entries[sc_idx]
+        for label_idx in entry["label_indices"]:
+            class_counts[label_idx] += 1
+
+    # Pseudo-labeled segments
+    pseudo_entries = _get_all_entries(pseudo_ds)
+    n_pseudo = len(pseudo_entries)
+    for entry in pseudo_entries:
         for label_idx in entry["label_indices"]:
             class_counts[label_idx] += 1
 
     # Avoid division by zero for classes with no training samples
     class_counts = np.maximum(class_counts, 1.0)
-    class_weights = 1.0 / class_counts  # inverse frequency
+
+    # Blend between uniform (alpha=0) and full inverse-frequency (alpha=1)
+    # alpha=0.5 gives sqrt(1/freq), a moderate boost
+    class_weights = (1.0 / class_counts) ** balance_alpha
 
     # Per-sample weight = weight of rarest positive label
-    n_total = n_train_audio + len(sc_train_indices)
+    n_total = n_train_audio + n_sc_train
     sample_weights = np.ones(n_total, dtype=np.float64)
 
     # Train audio samples (first n_train_audio in ConcatDataset)
@@ -579,11 +650,17 @@ def _build_class_balanced_sampler(audio_ds, audio_train_idx,
             w = max(w, class_weights[sec_idx])
         sample_weights[i] = w
 
-    # Soundscape samples (after train audio in ConcatDataset)
+    # Ground-truth soundscape samples
+    n_sc_gt = len(sc_train_indices)
     for i, sc_idx in enumerate(sc_train_indices):
-        entry = soundscape_ds.entries[sc_idx]
+        entry = soundscape_ds_gt.entries[sc_idx]
         w = max(class_weights[li] for li in entry["label_indices"])
         sample_weights[n_train_audio + i] = w
+
+    # Pseudo-labeled samples (after ground-truth soundscapes)
+    for i, entry in enumerate(pseudo_entries):
+        w = max(class_weights[li] for li in entry["label_indices"])
+        sample_weights[n_train_audio + n_sc_gt + i] = w
 
     sampler = WeightedRandomSampler(
         weights=sample_weights, num_samples=n_total, replacement=True
@@ -591,8 +668,11 @@ def _build_class_balanced_sampler(audio_ds, audio_train_idx,
 
     # Log class balance stats
     min_c, max_c = class_counts.min(), class_counts.max()
-    logger.info(f"Class-balanced sampler: class counts range [{min_c:.0f}, {max_c:.0f}], "
+    logger.info(f"Class-balanced sampler (alpha={balance_alpha}): "
+                f"class counts range [{min_c:.0f}, {max_c:.0f}], "
                 f"weight range [{sample_weights.min():.4f}, {sample_weights.max():.4f}]")
+    if n_pseudo > 0:
+        logger.info(f"  (includes {n_pseudo} pseudo-labeled segments)")
 
     return sampler
 
@@ -602,7 +682,7 @@ def get_dataloaders(data_dir, batch_size=32, num_workers=4, sample_rate=32000,
                     label_smoothing=0.0,
                     n_folds=5, fold=0, multi_mix=True, mix_prob=0.7,
                     preload=False, valid_regions_path=None,
-                    pseudo_labels_csv=None):
+                    pseudo_labels_csv=None, balance_alpha=0.5):
     """
     Convenience function returning DataLoaders ready for training.
 
@@ -617,9 +697,8 @@ def get_dataloaders(data_dir, batch_size=32, num_workers=4, sample_rate=32000,
     )
 
     sampler = _build_class_balanced_sampler(
-        split_info["audio_ds"], split_info["audio_train_idx"],
-        split_info["soundscape_ds"], split_info["sc_train_indices"],
-        num_classes, n_audio,
+        split_info, num_classes, n_audio, n_soundscape,
+        balance_alpha=balance_alpha,
     )
 
     train_loader = DataLoader(

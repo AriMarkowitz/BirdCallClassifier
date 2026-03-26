@@ -40,8 +40,48 @@ Only 66 of 10,658 soundscape files have labels (1,478 segments). The other 10,59
 - [x] **Replace BCELoss with focal loss** — implemented as `--loss focal` flag in train.py. Down-weights easy negatives (230+ absent species per segment), focuses gradients on hard positives. Default α=0.25, γ=2.0.
 - [ ] **Focal loss ablation** — compare BCE vs focal loss under the current HTSAT+NMF setup, especially once stronger augmentation is enabled. Check whether focal improves rare/quiet species recall without destabilizing calibration.
 
-### 4. Per-label error analysis + class imbalance audit
-- [ ] **Best / worst label analysis** — compute per-class metrics (AUC, AP, recall at fixed precision, calibration) and rank labels from easiest to hardest. Break this out separately for birds, insects, amphibians, etc.
+### 4. Regional hard-negative training with supplemental Pantanal species (PRIORITY)
+The Pantanal hosts ~650 bird species alone, but we only train on 234 classes. The other 400+ species are present in test soundscapes as unlabeled vocalizations. Without hearing them during training, the model either ignores them (lucky) or misclassifies them as one of our 234 targets (false positives). This is likely a major source of score loss.
+
+**Approach:** Expand the training set with audio from non-target Pantanal species, trained as additional classes. At inference, only predict the 234 target classes — the extra classes act as "hard negatives" that teach the model to distinguish our targets from acoustically similar non-target species.
+
+- [ ] **Curate Pantanal species list** — use eBird/GBIF checklists for the Pantanal region (Mato Grosso do Sul, Brazil) to identify which of the ~650 species are NOT in our 234-class taxonomy. Cross-reference with recording availability.
+- [ ] **Pull regional audio from iNat Sounds** — https://github.com/visipedia/inat_sounds has large-scale iNat audio. Filter by Pantanal-region species, deduplicate against existing train_audio (our iNat files have `iNat` prefix). This is the easiest source since format/quality matches our data.
+- [ ] **Pull regional audio from Xeno-canto** — filter by geographic bounding box (lat -16 to -22, lon -54 to -58) or by species list. CC-licensed. Xeno-canto has the best bird coverage.
+- [ ] **Pull from prior BirdCLEF competition data** — previous years' BirdCLEF datasets (2021-2025) cover South American species. Many will overlap with Pantanal fauna. Already in competition-compatible format.
+- [ ] **Expand classification head** — increase `num_classes` from 234 to 234 + N_extra. Train on all classes, but at inference time slice predictions to the original 234. The extra classes share the backbone so they improve feature learning without affecting the output format.
+- [ ] **Alternative: train extra species as a single "other" class** — simpler than adding hundreds of classes. All non-target species map to class 235 ("other"). The model learns "this is a bird but not one of ours." Less discriminative but much easier to implement.
+
+### 5. Fix worst per-class AUC species (PRIORITY)
+Per-class AUC analysis (run 313637, epoch 21) reveals two distinct failure modes:
+
+**Data-starved species (AUC < 0.6) — need more data urgently:**
+| Species | Common Name | Samples | Best AUC |
+|---|---|---|---|
+| 70711 | Cei's White-lipped Frog | 2 | 0.19 |
+| 209233 | Feral Horse | 2 | 0.24 |
+| 74113 | Highland (cattle) | 10 | 0.51 |
+| 476521 | Cuyaba Dwarf Frog | 3 | 0.87 |
+| 1595929 | Uruguay Harlequin Frog | 5 | 0.56 |
+| 555123 | Usina Tree Frog | 3 | 0.83 |
+
+These are nearly unlearnable with current data. Fixes: pseudo-labeling (in progress), supplemental audio from Xeno-canto/iNaturalist/Fonoteca Neotropical (see section 7).
+
+**Acoustically confused species (AUC 0.8-0.9, plenty of data) — need better representations:**
+| Species | Common Name | Samples | Best AUC |
+|---|---|---|---|
+| strowl1 | Striped Owl | 184 | 0.82 |
+| grekis | Great Kiskadee | 482 | 0.87 |
+| epaori4 | Variable Oriole | 188 | 0.86 |
+| ruther1 | Rufescent Tiger Heron | 86 | 0.84 |
+
+These have enough data but still underperform — likely acoustic confusion with similar species or domain shift from clean recordings to noisy soundscapes. Fixes: confusion matrix analysis to identify confusable pairs, targeted augmentation, multi-species mixing (in progress).
+
+- [ ] **Investigate Great Kiskadee confusion** — 482 samples but only 0.87 AUC. Likely confused with acoustically similar species. Check confusion matrix once available.
+- [ ] **Track worst-class AUC across rounds** — compare R1 vs R2 (pseudo-labeled) to see if rare species improve. If not, pseudo-label threshold may be too high for rare species.
+
+### 5. Per-label error analysis + class imbalance audit
+- [x] **Best / worst label analysis** — per-class AUC now logged every epoch (see section 4 above for initial results).
 - [ ] **Performance vs training frequency** — join per-label metrics with number of training examples, number of positive soundscape segments, and site coverage. Check whether weak labels are mostly just low-resource labels or whether some abundant classes are still failing due to confusion/domain shift.
 - [ ] **Confusion and co-occurrence review** — inspect which labels are commonly over-predicted, under-predicted, or confused with acoustically similar species / taxa. Use this to guide augmentation, thresholding, and targeted data collection.
 - [ ] **Rare-label validation slice** — maintain a reporting view focused on low-resource classes so leaderboard improvements are not driven only by already-common species.
@@ -65,10 +105,20 @@ Only 66 of 10,658 soundscape files have labels (1,478 segments). The other 10,59
   - **iNaturalist** — has audio observations, especially for herps; search by species + Pantanal/Mato Grosso region
   - **Fonoteca Neotropical (FN)** — specialized Neotropical animal sound archive hosted by Instituto Humboldt; best coverage for South American frogs and mammals
   - **YouTube field recordings** — search species common name + "call" or "vocalization"; extract audio clips and manually verify
+  - **iNat Sounds dataset** (https://github.com/visipedia/inat_sounds) — large-scale iNaturalist audio dataset with species labels. Check if our worst-performing species are represented and if the recordings are distinct from what's already in train_audio (our existing iNat files have `iNat` prefix — deduplicate by comparing filenames/URLs). High priority since our train_audio already comes partly from iNat, so format/quality will be consistent.
   - Priority targets (1 training sample each): Hooded Capuchin (516975), Waxy Monkey Tree Frog (23724), Southern Spectacled Caiman (116570), Central Dwarf Frog (23150)
   - Secondary targets (2-3 samples): Mato Grosso Snouted Tree Frog (24321), Cei's White-lipped Frog (70711), Feral Horse (209233), Cuyaba Dwarf Frog (476521), Muller's Termite Frog (25214), Yungas de la Paz Poison Frog (64898), Black-tailed Marmoset (74580), Usina Tree Frog (555123), Spot-tailed Nightjar (sptnig1), Cope's Swamp Froglet (23176)
 
-### 8. Class-balanced sampling / reweighting
+### 8. Audio quality as a training signal
+train.csv has a `rating` column (0-5 scale from Xeno-canto/iNaturalist): 6,845 files rated 5.0, 8,018 rated 4.0, and 12,849 rated 0.0 (unrated iNat). High-rated recordings are clean focal recordings; low-rated ones are noisy, distant, or have multiple species. This quality signal could be exploited in several ways:
+
+- [ ] **Quality-weighted loss** — weight each sample's contribution to the loss by its rating (e.g. `loss_weight = 0.5 + 0.5 * rating/5`). Clean recordings get full weight; noisy ones contribute less, reducing gradient noise from mislabeled or ambiguous clips. Simple to implement: just multiply the per-sample loss in `training_step`.
+- [ ] **Quality as an input feature** — concatenate a scalar quality embedding (or binned quality level) with the NMF latent features before the classification head. At inference time on soundscapes, use a fixed "soundscape quality" value (e.g. 2.0-3.0). This lets the model learn that low-quality inputs are more ambiguous and should produce softer predictions. Could also condition the model to be more conservative on noisy inputs.
+- [ ] **Quality-aware curriculum** — train first on high-quality recordings (rating ≥ 4) for clean gradient signal, then gradually mix in lower-quality recordings. The model learns clean species signatures first, then adapts to noisy conditions. Risk: may overfit to clean recordings early.
+- [ ] **Quality-stratified validation** — report val AUC separately for high/low quality clips to understand whether the model is failing on noisy inputs specifically.
+- [ ] **Quality-based sampling** — during training, oversample high-quality recordings for rare species (where every clean sample matters) while keeping natural quality distribution for common species.
+
+### 9. Class-balanced sampling / reweighting
 - [ ] **Balanced label sampling** — test a sampler that increases exposure of underrepresented labels so all classes are seen more uniformly during training. Important for multi-label data: balance by positive-label coverage, not just by clip count.
 - [ ] **Per-class loss weighting** — compare sampler-based balancing against per-class positive weights in the loss. Some labels may benefit more from loss reweighting than aggressive resampling.
 - [ ] **Hybrid sampling scheme** — keep some natural-frequency batches for calibration while reserving part of each epoch for rare-label upsampling. Goal: reduce imbalance without making the train distribution too unrealistic.

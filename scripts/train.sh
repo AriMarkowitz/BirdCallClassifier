@@ -82,6 +82,7 @@ fi
 FOLD="${FOLD:-0}"
 SEED="${SEED:-42}"
 RESUME_FROM="${RESUME_FROM:-}"
+PSEUDO_LABELS="${PSEUDO_LABELS:-}"
 
 # ── Run training ──
 JOB_ID="${SLURM_JOB_ID:-local_$(date +%Y%m%d_%H%M%S)}"
@@ -91,6 +92,12 @@ RESUME_ARG=""
 if [ -n "$RESUME_FROM" ]; then
     echo "Resuming from checkpoint: $RESUME_FROM"
     RESUME_ARG="--resume_from $RESUME_FROM"
+fi
+
+PSEUDO_ARG=""
+if [ -n "$PSEUDO_LABELS" ]; then
+    echo "Using pseudo-labels: $PSEUDO_LABELS"
+    PSEUDO_ARG="--pseudo_labels $PSEUDO_LABELS"
 fi
 
 python src/train.py \
@@ -106,11 +113,14 @@ python src/train.py \
     --label_smoothing 0.1 \
     --n_folds 5 \
     --fold "$FOLD" \
+    --mix_prob 0.3 \
+    --balance_alpha 0.5 \
     --use_wandb \
     --wandb_project birdclef-2026 \
     --run_name "htsat-${RUN_ID}" \
     --run_id "$RUN_ID" \
     --valid_regions "$VALID_REGIONS" \
-    $RESUME_ARG
+    $RESUME_ARG \
+    $PSEUDO_ARG
 
 echo "Training complete (run=$RUN_ID, fold=$FOLD)."

@@ -201,25 +201,48 @@ def main():
     logger.info(f"Model clip_samples: {clip_samples} "
                 f"({clip_samples / SAMPLE_RATE:.1f}s)")
 
-    # Find unlabeled soundscape files
+    # --- Collect files to pseudo-label ---
+    # 1. Unlabeled soundscapes (files in train_soundscapes/ without labels)
     soundscape_dir = data_dir / "train_soundscapes"
     labels_csv = data_dir / "train_soundscapes_labels.csv"
     labeled_df = pd.read_csv(labels_csv)
     labeled_files = set(labeled_df["filename"].unique())
 
-    all_files = sorted(f.name for f in soundscape_dir.glob("*.ogg"))
-    unlabeled_files = [f for f in all_files if f not in labeled_files]
-    logger.info(f"Total soundscape files: {len(all_files)}")
-    logger.info(f"Labeled: {len(labeled_files)}, Unlabeled: {len(unlabeled_files)}")
+    all_sc_files = sorted(f.name for f in soundscape_dir.glob("*.ogg"))
+    unlabeled_sc = [f for f in all_sc_files if f not in labeled_files]
+    logger.info(f"Soundscapes: {len(all_sc_files)} total, "
+                f"{len(labeled_files)} labeled, {len(unlabeled_sc)} unlabeled")
 
-    # Run inference on all unlabeled files
-    rows = []
+    # 2. Train audio files (discover secondary species not in existing labels)
+    audio_dir = data_dir / "train_audio"
+    train_df = pd.read_csv(data_dir / "train.csv")
+    # Build set of known labels per file for filtering later
+    known_labels_per_file = {}
+    for _, row in train_df.iterrows():
+        fn = row["filename"]
+        labels = {str(row["primary_label"])}
+        try:
+            import ast
+            sec = ast.literal_eval(str(row.get("secondary_labels", "[]")))
+            labels.update(str(s).strip() for s in sec)
+        except (ValueError, SyntaxError):
+            pass
+        known_labels_per_file[fn] = labels
+
+    # Collect train_audio files (they're in subdirectories like species/file.ogg)
+    train_audio_files = sorted(train_df["filename"].values)
+    logger.info(f"Train audio: {len(train_audio_files)} files to scan for secondary species")
+
+    # --- Run inference ---
+    rows_soundscape = []  # pseudo-labels for soundscapes (new training data)
+    rows_train_audio = [] # discovered secondary species in train_audio
     n_segments_total = 0
     n_segments_kept = 0
-    all_max_confs = []           # max confidence per segment (for distribution)
-    species_confs = {}           # species -> list of confidences (for per-species stats)
+    all_max_confs = []
+    species_confs = {}
 
-    for fn in tqdm(unlabeled_files, desc="Pseudo-labeling", mininterval=30):
+    # Process unlabeled soundscapes
+    for fn in tqdm(unlabeled_sc, desc="Pseudo-label soundscapes", mininterval=30):
         path = str(soundscape_dir / fn)
         try:
             audio = load_soundscape_audio(path)
@@ -237,7 +260,6 @@ def main():
             max_conf = float(prob.max())
             all_max_confs.append(max_conf)
 
-            # Find species above threshold
             above = np.where(prob >= args.threshold)[0]
             if len(above) == 0:
                 continue
@@ -250,12 +272,64 @@ def main():
                 sp = idx_to_label[i]
                 species_confs.setdefault(sp, []).append(float(prob[i]))
 
-            rows.append({
+            rows_soundscape.append({
                 "filename": fn,
                 "start": seconds_to_timestr(start_sec),
                 "end": seconds_to_timestr(end_sec),
                 "primary_label": label_str,
             })
+
+    logger.info(f"Soundscape pseudo-labeling: {n_segments_kept}/{n_segments_total} segments kept")
+
+    # Process train_audio for secondary species discovery
+    n_train_segments = 0
+    n_train_discoveries = 0
+    for fn in tqdm(train_audio_files, desc="Discover secondary species", mininterval=30):
+        path = str(audio_dir / fn)
+        try:
+            audio = load_soundscape_audio(path)
+        except Exception as e:
+            logger.warning(f"Skipping {fn}: {e}")
+            continue
+
+        segments, probs = predict_file(
+            model, audio, clip_samples, device,
+            batch_size=args.batch_size,
+        )
+
+        known = known_labels_per_file.get(fn, set())
+        for (start_sec, end_sec), prob in zip(segments, probs):
+            n_train_segments += 1
+
+            above = np.where(prob >= args.threshold)[0]
+            if len(above) == 0:
+                continue
+
+            # Only keep species NOT already labeled for this file
+            novel = [i for i in above if idx_to_label[i] not in known]
+            if not novel:
+                continue
+
+            n_train_discoveries += 1
+            novel_labels = [idx_to_label[i] for i in novel]
+            label_str = ";".join(novel_labels)
+
+            for i in novel:
+                sp = idx_to_label[i]
+                species_confs.setdefault(sp, []).append(float(prob[i]))
+                all_max_confs.append(float(prob[i]))
+
+            rows_train_audio.append({
+                "filename": fn,
+                "start": seconds_to_timestr(start_sec),
+                "end": seconds_to_timestr(end_sec),
+                "primary_label": label_str,
+            })
+
+    logger.info(f"Train audio secondary species: {n_train_discoveries}/{n_train_segments} "
+                f"segments with novel species")
+
+    rows = rows_soundscape + rows_train_audio
 
     # Save CSV
     output_path = Path(args.output)
@@ -293,11 +367,14 @@ def main():
     bottom10 = species_by_count[-10:] if len(species_by_count) > 10 else []
 
     # --- Log summary ---
+    total_kept = len(rows_soundscape) + len(rows_train_audio)
     logger.info(f"\nPseudo-labeling complete:")
-    logger.info(f"  Files processed: {len(unlabeled_files)}")
-    logger.info(f"  Total segments: {n_segments_total}")
-    logger.info(f"  Segments kept (threshold={args.threshold}): {n_segments_kept}")
-    logger.info(f"  Yield rate: {yield_rate:.1%}")
+    logger.info(f"  Soundscape: {len(unlabeled_sc)} files, "
+                f"{n_segments_kept}/{n_segments_total} segments kept")
+    logger.info(f"  Train audio: {len(train_audio_files)} files, "
+                f"{n_train_discoveries}/{n_train_segments} segments with novel species")
+    logger.info(f"  Total pseudo-labeled rows: {total_kept}")
+    logger.info(f"  Soundscape yield rate: {yield_rate:.1%}")
     logger.info(f"  Unique species: {len(unique_species)}/{num_classes}")
     if len(all_max_confs) > 0:
         logger.info(f"  Max-confidence distribution (all segments):")
@@ -319,9 +396,12 @@ def main():
     summary = {
         "checkpoint": args.checkpoint,
         "threshold": args.threshold,
-        "files_processed": len(unlabeled_files),
-        "total_segments": n_segments_total,
-        "segments_kept": n_segments_kept,
+        "soundscape_files": len(unlabeled_sc),
+        "soundscape_segments_kept": len(rows_soundscape),
+        "train_audio_files": len(train_audio_files),
+        "train_audio_discoveries": len(rows_train_audio),
+        "total_segments": n_segments_total + n_train_segments,
+        "segments_kept": total_kept,
         "yield_rate": round(yield_rate, 4),
         "unique_species": len(unique_species),
         "total_classes": num_classes,
