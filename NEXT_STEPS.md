@@ -1,17 +1,12 @@
 # BirdCLEF 2026 — Next Steps
 
 ## Done (current training)
-- [x] Site-based validation split — no data leakage
-- [x] WeightedRandomSampler upweighting soundscape data
 - [x] Wandb logging (train_loss, val_loss, val_macro_auc)
-- [x] 4-model ensemble with k-fold cross-validation
-- [x] Curriculum training (soundscape weight ramps 1.0 → 3.0)
+- [x] optional k-fold ensemble
 - [x] Secondary labels in train_audio (multi-hot targets)
 - [x] Label smoothing (ε=0.1)
 - [x] All taxonomy classes trained (birds, insects, amphibians, mammals, reptiles)
 - [x] NMF latent feature integration into HTSAT forward pass (global dictionary W_k56, nmf_proj head)
-- [x] Two-stage temporal fusion (implemented but made Kaggle score worse — temporal MLP overfits on 1183 soundscape samples, deprioritized)
-
 ## Key problem: domain shift
 Val AUC was 0.999 but Kaggle score is 0.848. The inflated val AUC was because validation only used soundscape segments (most species absent → trivially high AUC). **Fixed:** validation now includes a stratified holdout of train_audio + soundscape fold, so val AUC reflects all species. The model memorizes clean focal recordings but cannot generalize to noisy, polyphonic test soundscapes. Past BirdCLEF winners confirm this is THE problem to solve. Everything below is ordered by expected impact on closing this gap.
 
@@ -22,7 +17,7 @@ Val AUC was 0.999 but Kaggle score is 0.848. The inflated val AUC was because va
 ### 1. Noise-robust training with strong augmentation
 The model trains on clean single-species focal recordings but tests on noisy multi-species soundscapes. Augmentation bridges this domain gap.
 
-- [x] **Multi-species mixing** — implemented as `MultiSpeciesMixDataset` in dataset.py. Overlays 1-4 random train_audio clips at gains 0.1-0.7 with probability 0.7 per sample. Union of multi-hot labels. Enabled by default (`--multi_mix`, `--mix_prob 0.7`).
+- [x] **Multi-species mixing** — implemented as `MultiSpeciesMixDataset` in dataset.py. Overlays 1-4 random train_audio clips at gains 0.1-0.7 with probability 0.3 per sample. Union of multi-hot labels. Enabled by default (`--multi_mix`, `--mix_prob 0.3`).
 - [x] **MixUp / SuMix** — implemented as batch-level SuMix in train.py `_sumix()`. Shuffles batch and additively mixes waveforms with Beta-distributed lambda, soft-union labels. Enabled by default (`--mixup_alpha 0.4`).
 - [ ] **Soundscape background injection** — mix a random crop from the 10,593 unlabeled soundscape files as background noise behind clean train_audio clips. This is the most realistic noise source possible — same equipment, same sites, same ambient conditions as test data. ~5GB of free noise available in `data/train_soundscapes/`.
 - [x] **SpecAugment** — HTSAT already applies SpecAugmentation (time_drop_width=64, time_stripes_num=2, freq_drop_width=8, freq_stripes_num=2) during training. Built into the backbone.
@@ -34,10 +29,12 @@ The model trains on clean single-species focal recordings but tests on noisy mul
 ### 2. Iterative pseudo-labeling of unlabeled soundscapes
 Only 66 of 10,658 soundscape files have labels (1,478 segments). The other 10,593 files are unlabeled — this is a massive untapped resource. Past winners treated this as the #1 lever.
 
-- [ ] **Round 1: Generate pseudo-labels** — run current best model on all unlabeled soundscapes, segment into 5s windows, predict species probabilities. Filter by confidence threshold (e.g. keep predictions > 0.8).
+- [x] **Round 1: Generate pseudo-labels** — run current best model on all unlabeled soundscapes and all training data (for additiona secondar labels), segment into 5s windows, predict species probabilities. Filter by confidence threshold (e.g. keep predictions > 0.6).
+  - [ ] tune above paramter
 - [ ] **Round 2: Retrain with pseudo-labels** — add high-confidence pseudo-labeled segments to training set. Use soft labels (raw probabilities) instead of hard labels to reduce noise propagation.
 - [ ] **Round 3+: Iterate** — retrain → relabel → retrain. Each round improves the model's soundscape predictions, producing better pseudo-labels for the next round. Typically 2-3 rounds before diminishing returns.
 - [ ] **Pseudo-label filtering** — track prediction confidence across rounds. Remove samples where the model flip-flops (unstable predictions). Weight pseudo-labeled samples lower than ground-truth labeled samples in the loss.
+- [ ] **Train on Raw pseudo labels** - use raw probabilities for training
 
 ### 3. Focal loss
 - [x] **Replace BCELoss with focal loss** — implemented as `--loss focal` flag in train.py. Down-weights easy negatives (230+ absent species per segment), focuses gradients on hard positives. Default α=0.25, γ=2.0.
@@ -50,7 +47,7 @@ Only 66 of 10,658 soundscape files have labels (1,478 segments). The other 10,59
 - [ ] **Rare-label validation slice** — maintain a reporting view focused on low-resource classes so leaderboard improvements are not driven only by already-common species.
 
 ### 5. Bird-MAE-Base backbone (deprioritized)
-- [ ] **Replace HTSAT with Bird-MAE-Base** — self-supervised ViT-B/16 (85M params, 768-dim embeddings) pretrained via masked autoencoder on BirdSet's 9.7k species ([model](https://huggingface.co/DBD-research-group/Bird-MAE-Base)). Potentially better representations but ~2.5x larger than HTSAT-tiny. Previously prototyped on `bird-mae-backbone` branch but deprioritized in favor of HTSAT+NMF approach. Would need to verify it fits in Kaggle's 90-min CPU inference window.
+- [x] **Replace HTSAT with Bird-MAE-Base** — NO NOTABLE BENEFIT - self-supervised ViT-B/16 (85M params, 768-dim embeddings) pretrained via masked autoencoder on BirdSet's 9.7k species ([model](https://huggingface.co/DBD-research-group/Bird-MAE-Base)). Potentially better representations but ~2.5x larger than HTSAT-tiny. Previously prototyped on `bird-mae-backbone` branch but deprioritized in favor of HTSAT+NMF approach. Would need to verify it fits in Kaggle's 90-min CPU inference window.
 
 ---
 
