@@ -7,7 +7,14 @@ Dataset classes:
   - MultiSpeciesMixDataset:  wraps TrainAudioDataset, overlays multiple clips
                              to simulate polyphonic soundscapes
 
-Both return {"waveform": np.float32 (clip_samples,), "target": np.float32 (num_classes,)}
+Variable-length support:
+  - Datasets return waveforms of varying lengths (capped at max_duration).
+  - A custom collate function pads each batch to the longest waveform.
+  - The EfficientNet backbone handles arbitrary time dimensions natively
+    via AdaptiveAvgPool2d before the classifier head.
+
+Both return {"waveform": np.float32 (T,), "target": np.float32 (num_classes,)}
+where T varies per sample.
 """
 
 import os
@@ -22,6 +29,11 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Default duration bounds (seconds)
+DEFAULT_MIN_DURATION = 3.0
+DEFAULT_MAX_DURATION = 30.0
+
+
 def build_label_map(taxonomy_path):
     """Build mapping from primary_label (str) -> class index using taxonomy.csv."""
     df = pd.read_csv(taxonomy_path)
@@ -35,24 +47,51 @@ def _parse_site_id(filename):
     return f"S{m.group(1)}" if m else None
 
 
+def variable_length_collate_fn(batch):
+    """Collate variable-length waveforms by padding to max length in the batch.
+
+    Returns:
+        dict with:
+          "waveform": (B, T_max) float32 tensor, zero-padded
+          "target":   (B, num_classes) float32 tensor
+          "lengths":  (B,) int64 tensor of original waveform lengths
+    """
+    waveforms = [sample["waveform"] for sample in batch]
+    targets = [sample["target"] for sample in batch]
+
+    lengths = [len(w) for w in waveforms]
+    max_len = max(lengths)
+
+    padded = np.zeros((len(batch), max_len), dtype=np.float32)
+    for i, w in enumerate(waveforms):
+        padded[i, :len(w)] = w
+
+    return {
+        "waveform": torch.from_numpy(padded),
+        "target": torch.from_numpy(np.stack(targets)),
+        "lengths": torch.tensor(lengths, dtype=torch.long),
+    }
+
+
 class TrainAudioDataset(Dataset):
     """
     Loads individual species recordings from train_audio/.
     Each audio file maps to one primary_label (single-label, stored as multi-hot).
 
-    When preload=True, all waveforms are loaded into RAM at init time
-    (random-cropped to clip_samples). This avoids repeated disk I/O and
-    is essential for MultiSpeciesMixDataset which loads 2-5 clips per sample.
-    Memory cost: ~N * clip_samples * 4 bytes (e.g. 28k * 320k * 4 ≈ 34 GB).
+    Returns variable-length waveforms between min_duration and max_duration.
+    When preload=True, all waveforms are loaded into RAM (cropped to max_duration).
     """
 
     def __init__(self, csv_path, audio_dir, label_map, sample_rate=32000,
-                 clip_duration=10.0, label_smoothing=0.0, preload=False,
+                 min_duration=DEFAULT_MIN_DURATION,
+                 max_duration=DEFAULT_MAX_DURATION,
+                 label_smoothing=0.0, preload=False,
                  valid_regions=None):
         self.audio_dir = audio_dir
         self.label_map = label_map
         self.sample_rate = sample_rate
-        self.clip_samples = int(sample_rate * clip_duration)
+        self.min_samples = int(sample_rate * min_duration)
+        self.max_samples = int(sample_rate * max_duration)
         self.num_classes = len(label_map)
         self.label_smoothing = label_smoothing
         self.preload = preload
@@ -110,14 +149,13 @@ class TrainAudioDataset(Dataset):
             self._preload_all()
 
     def _preload_all(self):
-        """Load all audio files into RAM, cropped to clip_samples.
+        """Load all audio files into RAM, cropped to max_samples.
 
         Uses valid_regions if available to crop from active vocal regions.
-        This keeps RAM predictable: N * clip_samples * 4 bytes.
         """
         logger.info(f"Preloading {len(self.filenames)} audio files into RAM "
-                     f"(cropped to {self.clip_samples} samples = "
-                     f"{self.clip_samples / self.sample_rate:.1f}s)...")
+                     f"(capped at {self.max_samples} samples = "
+                     f"{self.max_samples / self.sample_rate:.1f}s)...")
         waveforms = []
         for i, fn in enumerate(self.filenames):
             path = os.path.join(self.audio_dir, fn)
@@ -132,7 +170,7 @@ class TrainAudioDataset(Dataset):
         logger.info(f"Preload complete: {len(waveforms)} clips, {total_gb:.1f} GB")
 
     def _load_audio_raw(self, path):
-        """Load and resample audio to mono, but do NOT crop to clip_samples."""
+        """Load and resample audio to mono, but do NOT crop."""
         try:
             audio, sr = sf.read(path, dtype="float32")
         except Exception:
@@ -162,12 +200,11 @@ class TrainAudioDataset(Dataset):
         }
 
     def _crop_from_regions(self, audio, regions):
-        """Crop clip_samples from a valid vocal region.
+        """Crop a variable-length segment from a valid vocal region.
 
+        Returns a waveform between min_samples and max_samples in length.
         If valid_regions are available, picks a random region weighted by
-        duration, then picks a random start within it. If the region is
-        shorter than clip_samples, pads with silence. Falls back to random
-        crop if no regions are available.
+        duration. Falls back to random crop if no regions are available.
         """
         if not regions:
             return self._fit_length(audio)
@@ -184,27 +221,32 @@ class TrainAudioDataset(Dataset):
         reg_end = max(reg_start, min(reg_end, len(audio)))
         reg_len = reg_end - reg_start
 
-        if reg_len >= self.clip_samples:
-            # Random crop within the region
-            start = reg_start + np.random.randint(0, reg_len - self.clip_samples + 1)
-            return audio[start:start + self.clip_samples].astype(np.float32)
+        if reg_len >= self.max_samples:
+            # Random crop to max_samples within the region
+            start = reg_start + np.random.randint(0, reg_len - self.max_samples + 1)
+            return audio[start:start + self.max_samples].astype(np.float32)
+        elif reg_len >= self.min_samples:
+            # Region is within [min, max] — use as-is (variable length)
+            return audio[reg_start:reg_end].astype(np.float32)
         else:
-            # Region shorter than clip_samples — use what we have and pad
+            # Region shorter than min_samples — pad with silence to min_samples
             clip = audio[reg_start:reg_end].astype(np.float32)
-            pad = np.zeros(self.clip_samples - len(clip), dtype=np.float32)
+            if len(clip) == 0:
+                return np.zeros(self.min_samples, dtype=np.float32)
+            pad = np.zeros(self.min_samples - len(clip), dtype=np.float32)
             return np.concatenate([clip, pad])
 
     def _fit_length(self, audio):
-        """Pad with zeros or randomly crop to exactly clip_samples (fallback)."""
-        if len(audio) < self.clip_samples:
-            pad = np.zeros(self.clip_samples - len(audio), dtype=np.float32)
-            audio = np.concatenate([audio, pad])
-        elif len(audio) > self.clip_samples:
-            start = np.random.randint(0, len(audio) - self.clip_samples)
-            audio = audio[start:start + self.clip_samples]
+        """Return variable-length waveform capped at max_samples, padded to min_samples."""
+        if len(audio) > self.max_samples:
+            start = np.random.randint(0, len(audio) - self.max_samples)
+            return audio[start:start + self.max_samples].astype(np.float32)
+        elif len(audio) < self.min_samples:
+            pad = np.zeros(self.min_samples - len(audio), dtype=np.float32)
+            return np.concatenate([audio, pad]).astype(np.float32)
         else:
-            audio = audio.copy()
-        return audio.astype(np.float32)
+            # Already in [min_samples, max_samples] — return as-is
+            return audio.copy().astype(np.float32)
 
 
 class MultiSpeciesMixDataset(Dataset):
@@ -216,9 +258,8 @@ class MultiSpeciesMixDataset(Dataset):
     found in real soundscapes. The target is the union of all constituent
     labels (multi-hot OR).
 
-    This is the competition-specific multi-species mixing strategy used by
-    past BirdCLEF winners to bridge the domain gap between clean focal
-    recordings and noisy multi-species test soundscapes.
+    When mixing variable-length clips, extras are truncated or zero-padded
+    to match the anchor's length.
     """
 
     def __init__(self, base_dataset, min_mix=1, max_mix=2, mix_prob=0.3,
@@ -241,10 +282,18 @@ class MultiSpeciesMixDataset(Dataset):
         if np.random.rand() < self.mix_prob:
             n_extra = np.random.randint(self.min_mix, self.max_mix + 1)
             extra_indices = np.random.randint(0, len(self.base), size=n_extra)
+            anchor_len = len(waveform)
             for extra_idx in extra_indices:
                 extra = self.base[extra_idx]
+                extra_wav = extra["waveform"]
+                # Align lengths: truncate or pad extra to anchor length
+                if len(extra_wav) > anchor_len:
+                    extra_wav = extra_wav[:anchor_len]
+                elif len(extra_wav) < anchor_len:
+                    pad = np.zeros(anchor_len - len(extra_wav), dtype=np.float32)
+                    extra_wav = np.concatenate([extra_wav, pad])
                 gain = np.random.uniform(*self.gain_range)
-                waveform = waveform + gain * extra["waveform"]
+                waveform = waveform + gain * extra_wav
                 # Scale extra labels by gain so target reflects audibility:
                 # a species mixed at 0.2 gain gets a 0.2 target, not 1.0
                 target = np.maximum(target, gain * extra["target"])
@@ -266,14 +315,17 @@ class SoundscapeDataset(Dataset):
     Loads 5-second segments from train_soundscapes/.
     Labels are multi-hot (multiple species per segment).
     Audio is loaded on-the-fly; only the needed segment is read.
+
+    Returns natural segment length (no forced padding/tiling).
+    Short segments are padded to min_samples.
     """
 
     def __init__(self, labels_csv, soundscape_dir, label_map, sample_rate=32000,
-                 clip_duration=10.0, label_smoothing=0.0):
+                 min_duration=DEFAULT_MIN_DURATION, label_smoothing=0.0):
         self.soundscape_dir = soundscape_dir
         self.label_map = label_map
         self.sample_rate = sample_rate
-        self.clip_samples = int(sample_rate * clip_duration)
+        self.min_samples = int(sample_rate * min_duration)
         self.num_classes = len(label_map)
         self.label_smoothing = label_smoothing
 
@@ -321,9 +373,14 @@ class SoundscapeDataset(Dataset):
             audio = librosa.resample(audio, orig_sr=sr, target_sr=self.sample_rate)
 
         audio = audio.astype(np.float32)
-        if len(audio) < self.clip_samples:
-            repeats = (self.clip_samples // max(len(audio), 1)) + 1
-            audio = np.tile(audio, repeats)[:self.clip_samples]
+
+        # Pad very short segments to minimum length
+        if len(audio) < self.min_samples:
+            if len(audio) == 0:
+                audio = np.zeros(self.min_samples, dtype=np.float32)
+            else:
+                repeats = (self.min_samples // len(audio)) + 1
+                audio = np.tile(audio, repeats)[:self.min_samples]
 
         eps = self.label_smoothing
         target = np.full(self.num_classes, eps / self.num_classes, dtype=np.float32)
@@ -336,7 +393,10 @@ class SoundscapeDataset(Dataset):
         }
 
 
-def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
+def get_datasets(data_dir, sample_rate=32000,
+                 min_duration=DEFAULT_MIN_DURATION,
+                 max_duration=DEFAULT_MAX_DURATION,
+                 val_frac=0.25,
                  seed=42, label_smoothing=0.0, n_folds=5, fold=0,
                  multi_mix=True, mix_prob=0.7, preload=False,
                  valid_regions_path=None, pseudo_labels_csv=None):
@@ -351,6 +411,8 @@ def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
     augmentation when multi_mix=True.
 
     Args:
+        min_duration: minimum clip duration in seconds (shorter clips padded)
+        max_duration: maximum clip duration in seconds (longer clips cropped)
         n_folds: number of CV folds (default 5)
         fold: which fold to hold out for validation (0 to n_folds-1)
         multi_mix: enable multi-species mixing augmentation on train_audio
@@ -382,17 +444,20 @@ def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
                         f"falling back to random cropping")
 
     # --- Train audio: split into train/val by primary_label (stratified) ---
-    # Preload waveforms into RAM to avoid repeated disk I/O during mixing
     audio_ds_full = TrainAudioDataset(
         train_csv, audio_dir, label_map,
-        sample_rate=sample_rate, clip_duration=clip_duration,
+        sample_rate=sample_rate,
+        min_duration=min_duration,
+        max_duration=max_duration,
         label_smoothing=label_smoothing, preload=preload,
         valid_regions=valid_regions,
     )
     # Val dataset: hard labels, shares preloaded waveforms to avoid double RAM
     audio_ds_val_hard = TrainAudioDataset(
         train_csv, audio_dir, label_map,
-        sample_rate=sample_rate, clip_duration=clip_duration,
+        sample_rate=sample_rate,
+        min_duration=min_duration,
+        max_duration=max_duration,
         label_smoothing=0.0, preload=False,
         valid_regions=valid_regions,
     )
@@ -416,19 +481,14 @@ def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
         n = len(idxs)
 
         if n == 1:
-            # Only 1 sample: put in both train and val (duplicated into val
-            # so the class is evaluable; also kept in train so it's learned)
             audio_val_idx.extend(idxs.tolist())
             audio_train_idx.extend(idxs.tolist())
             continue
 
-        # At least 1 per fold, but respect fold boundaries
         fold_sz = max(n // n_folds, 1)
         v_start = fold * fold_sz
         v_end = v_start + fold_sz if fold < n_folds - 1 else n
 
-        # If this fold's slice is empty (fold index beyond available data),
-        # take the last sample to guarantee representation
         if v_start >= n:
             audio_val_idx.append(idxs[-1])
             audio_train_idx.extend(idxs.tolist())
@@ -446,21 +506,19 @@ def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
         audio_train_mixed = MultiSpeciesMixDataset(
             audio_train_sub, min_mix=1, max_mix=2, mix_prob=mix_prob,
         )
-        logger.info(f"Multi-species mixing enabled: prob={mix_prob}, 1-4 extra clips per sample")
+        logger.info(f"Multi-species mixing enabled: prob={mix_prob}, 1-2 extra clips per sample")
     else:
         audio_train_mixed = audio_train_sub
 
     # --- Soundscape segments: stratified k-fold split ---
-    # Ground-truth soundscape dataset (no pseudo-labels) for splitting.
-    # Pseudo-labels are added to the train portion only after the split.
     soundscape_ds_gt = SoundscapeDataset(
         soundscape_csv, soundscape_dir, label_map,
-        sample_rate=sample_rate, clip_duration=clip_duration,
+        sample_rate=sample_rate, min_duration=min_duration,
         label_smoothing=label_smoothing,
     )
     soundscape_ds_val = SoundscapeDataset(
         soundscape_csv, soundscape_dir, label_map,
-        sample_rate=sample_rate, clip_duration=clip_duration,
+        sample_rate=sample_rate, min_duration=min_duration,
         label_smoothing=0.0,
     )
 
@@ -470,7 +528,6 @@ def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
 
     sc_label_to_indices = {}
     for i, entry in enumerate(soundscape_ds_gt.entries):
-        # Use first label as stratification key
         key = entry["label_indices"][0]
         sc_label_to_indices.setdefault(key, []).append(i)
 
@@ -482,7 +539,6 @@ def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
         n = len(idxs)
 
         if n == 1:
-            # Same as train_audio: put in both so class is evaluable
             sc_val_indices.extend(idxs.tolist())
             sc_train_indices.extend(idxs.tolist())
             continue
@@ -504,13 +560,9 @@ def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
     sc_val = Subset(soundscape_ds_val, sc_val_indices)
 
     # Add pseudo-labeled segments to training only.
-    # The pseudo-label CSV may contain entries from both train_soundscapes/
-    # and train_audio/ (secondary species discoveries). Split by checking
-    # which directory the file lives in.
     pseudo_ds = None
     if pseudo_labels_csv and os.path.isfile(pseudo_labels_csv):
         pseudo_df = pd.read_csv(pseudo_labels_csv)
-        # Entries with "/" in filename are from train_audio (e.g. "species/file.ogg")
         sc_mask = ~pseudo_df["filename"].str.contains("/", na=False)
         audio_mask = pseudo_df["filename"].str.contains("/", na=False)
 
@@ -522,7 +574,7 @@ def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
             pseudo_df[sc_mask].to_csv(sc_pseudo_csv, index=False)
             sc_pseudo_ds = SoundscapeDataset(
                 sc_pseudo_csv, soundscape_dir, label_map,
-                sample_rate=sample_rate, clip_duration=clip_duration,
+                sample_rate=sample_rate, min_duration=min_duration,
                 label_smoothing=label_smoothing,
             )
             pseudo_parts.append(sc_pseudo_ds)
@@ -535,7 +587,7 @@ def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
             pseudo_df[audio_mask].to_csv(audio_pseudo_csv, index=False)
             audio_pseudo_ds = SoundscapeDataset(
                 audio_pseudo_csv, audio_dir, label_map,
-                sample_rate=sample_rate, clip_duration=clip_duration,
+                sample_rate=sample_rate, min_duration=min_duration,
                 label_smoothing=label_smoothing,
             )
             pseudo_parts.append(audio_pseudo_ds)
@@ -551,18 +603,14 @@ def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
         sc_train = sc_train_gt
 
     # --- Combine ---
-    # Train = mixed train_audio (train fold) + soundscape (train fold)
     n_train_audio = len(audio_train_mixed)
     train_ds = ConcatDataset([audio_train_mixed, sc_train])
-
-    # Val = train_audio (val fold, hard labels) + soundscape (val fold, hard labels)
     val_ds = ConcatDataset([audio_val_sub, sc_val])
 
     logger.info(f"Fold {fold}/{n_folds}: "
                 f"Train = {n_train_audio} audio (mixed) + {len(sc_train)} soundscape, "
                 f"Val = {len(audio_val_sub)} audio + {len(sc_val)} soundscape")
 
-    # Return extra info needed for class-balanced sampling
     split_info = {
         "audio_ds": audio_ds_full,
         "audio_train_idx": audio_train_idx,
@@ -611,38 +659,29 @@ def _build_class_balanced_sampler(split_info, num_classes, n_train_audio, n_sc_t
     # Count class frequencies across all training samples
     class_counts = np.zeros(num_classes, dtype=np.float64)
 
-    # Train audio: use primary label (+ secondary labels)
     for idx in audio_train_idx:
         label_idx = audio_ds.label_map[audio_ds.labels[idx]]
         class_counts[label_idx] += 1
         for sec_idx in audio_ds.secondary_labels[idx]:
             class_counts[sec_idx] += 1
 
-    # Ground-truth soundscape segments
     for sc_idx in sc_train_indices:
         entry = soundscape_ds_gt.entries[sc_idx]
         for label_idx in entry["label_indices"]:
             class_counts[label_idx] += 1
 
-    # Pseudo-labeled segments
     pseudo_entries = _get_all_entries(pseudo_ds)
     n_pseudo = len(pseudo_entries)
     for entry in pseudo_entries:
         for label_idx in entry["label_indices"]:
             class_counts[label_idx] += 1
 
-    # Avoid division by zero for classes with no training samples
     class_counts = np.maximum(class_counts, 1.0)
-
-    # Blend between uniform (alpha=0) and full inverse-frequency (alpha=1)
-    # alpha=0.5 gives sqrt(1/freq), a moderate boost
     class_weights = (1.0 / class_counts) ** balance_alpha
 
-    # Per-sample weight = weight of rarest positive label
     n_total = n_train_audio + n_sc_train
     sample_weights = np.ones(n_total, dtype=np.float64)
 
-    # Train audio samples (first n_train_audio in ConcatDataset)
     for i, idx in enumerate(audio_train_idx):
         label_idx = audio_ds.label_map[audio_ds.labels[idx]]
         w = class_weights[label_idx]
@@ -650,14 +689,12 @@ def _build_class_balanced_sampler(split_info, num_classes, n_train_audio, n_sc_t
             w = max(w, class_weights[sec_idx])
         sample_weights[i] = w
 
-    # Ground-truth soundscape samples
     n_sc_gt = len(sc_train_indices)
     for i, sc_idx in enumerate(sc_train_indices):
         entry = soundscape_ds_gt.entries[sc_idx]
         w = max(class_weights[li] for li in entry["label_indices"])
         sample_weights[n_train_audio + i] = w
 
-    # Pseudo-labeled samples (after ground-truth soundscapes)
     for i, entry in enumerate(pseudo_entries):
         w = max(class_weights[li] for li in entry["label_indices"])
         sample_weights[n_train_audio + n_sc_gt + i] = w
@@ -666,7 +703,6 @@ def _build_class_balanced_sampler(split_info, num_classes, n_train_audio, n_sc_t
         weights=sample_weights, num_samples=n_total, replacement=True
     )
 
-    # Log class balance stats
     min_c, max_c = class_counts.min(), class_counts.max()
     logger.info(f"Class-balanced sampler (alpha={balance_alpha}): "
                 f"class counts range [{min_c:.0f}, {max_c:.0f}], "
@@ -678,7 +714,9 @@ def _build_class_balanced_sampler(split_info, num_classes, n_train_audio, n_sc_t
 
 
 def get_dataloaders(data_dir, batch_size=32, num_workers=4, sample_rate=32000,
-                    clip_duration=10.0, val_frac=0.25, seed=42,
+                    min_duration=DEFAULT_MIN_DURATION,
+                    max_duration=DEFAULT_MAX_DURATION,
+                    val_frac=0.25, seed=42,
                     label_smoothing=0.0,
                     n_folds=5, fold=0, multi_mix=True, mix_prob=0.7,
                     preload=False, valid_regions_path=None,
@@ -687,9 +725,11 @@ def get_dataloaders(data_dir, batch_size=32, num_workers=4, sample_rate=32000,
     Convenience function returning DataLoaders ready for training.
 
     Uses class-balanced sampling so every species is well represented per epoch.
+    Uses variable_length_collate_fn to pad batches to the longest waveform.
     """
     train_ds, val_ds, label_map, num_classes, n_audio, n_soundscape, split_info = get_datasets(
-        data_dir, sample_rate=sample_rate, clip_duration=clip_duration,
+        data_dir, sample_rate=sample_rate,
+        min_duration=min_duration, max_duration=max_duration,
         val_frac=val_frac, seed=seed, label_smoothing=label_smoothing,
         n_folds=n_folds, fold=fold, multi_mix=multi_mix, mix_prob=mix_prob,
         preload=preload, valid_regions_path=valid_regions_path,
@@ -710,6 +750,7 @@ def get_dataloaders(data_dir, batch_size=32, num_workers=4, sample_rate=32000,
         drop_last=True,
         persistent_workers=num_workers > 0,
         prefetch_factor=8 if num_workers > 0 else None,
+        collate_fn=variable_length_collate_fn,
     )
 
     val_loader = DataLoader(
@@ -721,6 +762,7 @@ def get_dataloaders(data_dir, batch_size=32, num_workers=4, sample_rate=32000,
         drop_last=False,
         persistent_workers=num_workers > 0,
         prefetch_factor=8 if num_workers > 0 else None,
+        collate_fn=variable_length_collate_fn,
     )
 
     return train_loader, val_loader, label_map, num_classes, n_audio

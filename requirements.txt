@@ -4,10 +4,11 @@ torch>=2.5.0
 torchvision
 torchaudio
 
-# HTSAT / training
+# Model backbone
+timm>=1.0.0
+
+# Training
 pytorch_lightning>=1.9.0,<2.0
-torchlibrosa
-torchcontrib
 torchmetrics
 
 # setuptools <81 needed for pkg_resources (required by pytorch_lightning 1.x)
@@ -22,12 +23,8 @@ pandas
 scikit-learn
 scipy
 numpy
-h5py
 
 # Logging
 tensorboard
 tqdm
 wandb
-
-# HTSAT dependency (museval used in utils.py)
-museval

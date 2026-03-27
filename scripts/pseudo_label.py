@@ -1,10 +1,10 @@
 """
 Generate pseudo-labels for unlabeled soundscape files.
 
-Runs a trained BirdCLEF model on all unlabeled soundscape files in 5-second
-sliding windows, filters predictions by confidence threshold, and outputs
-a CSV in the same format as train_soundscapes_labels.csv so SoundscapeDataset
-can load it directly.
+Runs a trained BirdCLEF EfficientNet model on all unlabeled soundscape files
+in 5-second sliding windows, filters predictions by confidence threshold,
+and outputs a CSV in the same format as train_soundscapes_labels.csv so
+SoundscapeDataset can load it directly.
 
 Usage:
     python scripts/pseudo_label.py \
@@ -12,9 +12,6 @@ Usage:
         --data-dir data \
         --output data/pseudo_labels.csv \
         --threshold 0.8
-
-The output CSV has columns: filename, start, end, primary_label
-matching the format of train_soundscapes_labels.csv.
 """
 
 import argparse
@@ -33,11 +30,9 @@ import torch
 from tqdm import tqdm
 
 PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(PROJ_ROOT, "external", "htsat"))
 sys.path.insert(0, os.path.join(PROJ_ROOT, "src"))
 
-import config as htsat_config
-from model.htsat import HTSAT_Swin_Transformer
+from model import BirdCLEFModel
 from dataset import build_label_map
 
 logging.basicConfig(level=logging.INFO)
@@ -48,32 +43,23 @@ SEGMENT_DURATION = 5.0  # seconds — matches soundscape label format
 SEGMENT_SAMPLES = int(SAMPLE_RATE * SEGMENT_DURATION)
 
 
-def load_model(checkpoint_path, num_classes, device):
+def load_model(checkpoint_path, num_classes, device, backbone="tf_efficientnet_b0_ns"):
     """Load a trained BirdCLEFWrapper from a Lightning checkpoint."""
-    htsat_config.classes_num = num_classes
-    htsat_config.loss_type = "clip_bce"
-    htsat_config.enable_tscam = True
-
-    model = HTSAT_Swin_Transformer(
-        spec_size=htsat_config.htsat_spec_size,
-        patch_size=htsat_config.htsat_patch_size,
-        patch_stride=htsat_config.htsat_stride,
+    model = BirdCLEFModel(
         num_classes=num_classes,
-        embed_dim=htsat_config.htsat_dim,
-        depths=htsat_config.htsat_depth,
-        num_heads=htsat_config.htsat_num_head,
-        window_size=htsat_config.htsat_window_size,
-        config=htsat_config,
+        backbone_name=backbone,
+        sample_rate=SAMPLE_RATE,
+        pretrained=False,  # weights come from checkpoint
     )
 
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state_dict = ckpt.get("state_dict", ckpt)
 
-    # Lightning wraps in "sed_model." prefix
+    # Lightning wraps in "model." prefix
     cleaned = {}
     for k, v in state_dict.items():
-        k = k.replace("sed_model.sed_model.", "")
-        k = k.replace("sed_model.", "")
+        k = k.replace("model.model.", "model.")
+        k = k.replace("model.", "", 1) if k.startswith("model.") else k
         cleaned[k] = v
 
     missing, unexpected = model.load_state_dict(cleaned, strict=False)
@@ -110,11 +96,10 @@ def seconds_to_timestr(sec):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def predict_file(model, audio, clip_samples, device, batch_size=32):
+def predict_file(model, audio, device, batch_size=32):
     """Run inference on a soundscape file in 5s sliding windows.
 
-    The model expects clip_samples (e.g. 10s), so each 5s segment is
-    zero-padded to clip_samples before inference.
+    Each 5s segment is passed directly to the model (variable-length capable).
 
     Returns:
         segments: list of (start_sec, end_sec)
@@ -124,34 +109,27 @@ def predict_file(model, audio, clip_samples, device, batch_size=32):
     segments = []
     waveforms = []
 
-    # Slide in 5s windows
     for start in range(0, n_samples, SEGMENT_SAMPLES):
         end = start + SEGMENT_SAMPLES
         if end > n_samples:
-            break  # skip incomplete final segment
+            break
 
         segment = audio[start:end]
-
-        # Pad to model's expected clip_samples
-        if len(segment) < clip_samples:
-            pad = np.zeros(clip_samples - len(segment), dtype=np.float32)
-            segment = np.concatenate([segment, pad])
-
         waveforms.append(segment)
         segments.append((start / SAMPLE_RATE, end / SAMPLE_RATE))
 
     if not waveforms:
         return [], np.array([])
 
-    # Batch inference
+    # Batch inference — all segments are same length (5s) so no padding needed
     all_probs = []
     for i in range(0, len(waveforms), batch_size):
         batch = np.stack(waveforms[i:i + batch_size])
         batch_tensor = torch.from_numpy(batch).to(device)
 
         with torch.no_grad():
-            output = model(batch_tensor, None)
-            clipwise = output["clipwise_output"]  # already sigmoided
+            output = model(batch_tensor)
+            clipwise = output["clipwise_output"]
             all_probs.append(clipwise.cpu().numpy())
 
     probs = np.concatenate(all_probs, axis=0)
@@ -161,24 +139,16 @@ def predict_file(model, audio, clip_samples, device, batch_size=32):
 def main():
     parser = argparse.ArgumentParser(
         description="Generate pseudo-labels for unlabeled soundscapes")
-    parser.add_argument("--checkpoint", type=str, required=True,
-                        help="Path to trained Lightning checkpoint (.ckpt)")
+    parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--output", type=str, default="data/pseudo_labels.csv")
-    parser.add_argument("--threshold", type=float, default=0.8,
-                        help="Confidence threshold for keeping predictions")
-    parser.add_argument("--batch-size", type=int, default=64,
-                        help="Batch size for inference")
-    parser.add_argument("--device", type=str, default="auto",
-                        help="Device: 'auto', 'cuda', or 'cpu'")
-    parser.add_argument("--soft-labels", action="store_true",
-                        help="Output soft probabilities instead of hard labels")
-    parser.add_argument("--use_wandb", action="store_true",
-                        help="Log pseudo-label statistics to W&B")
-    parser.add_argument("--wandb_project", type=str, default="birdclef-2026",
-                        help="W&B project name")
-    parser.add_argument("--run_name", type=str, default=None,
-                        help="W&B run name for pseudo-labeling step")
+    parser.add_argument("--threshold", type=float, default=0.8)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--backbone", type=str, default="tf_efficientnet_b0_ns")
+    parser.add_argument("--use_wandb", action="store_true")
+    parser.add_argument("--wandb_project", type=str, default="birdclef-2026")
+    parser.add_argument("--run_name", type=str, default=None)
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -189,20 +159,14 @@ def main():
         device = torch.device(args.device)
     logger.info(f"Using device: {device}")
 
-    # Build label map
     label_map = build_label_map(str(data_dir / "taxonomy.csv"))
     num_classes = len(label_map)
     idx_to_label = {v: k for k, v in label_map.items()}
     logger.info(f"Classes: {num_classes}")
 
-    # Load model
-    model = load_model(args.checkpoint, num_classes, device)
-    clip_samples = htsat_config.clip_samples
-    logger.info(f"Model clip_samples: {clip_samples} "
-                f"({clip_samples / SAMPLE_RATE:.1f}s)")
+    model = load_model(args.checkpoint, num_classes, device, backbone=args.backbone)
 
     # --- Collect files to pseudo-label ---
-    # 1. Unlabeled soundscapes (files in train_soundscapes/ without labels)
     soundscape_dir = data_dir / "train_soundscapes"
     labels_csv = data_dir / "train_soundscapes_labels.csv"
     labeled_df = pd.read_csv(labels_csv)
@@ -213,10 +177,9 @@ def main():
     logger.info(f"Soundscapes: {len(all_sc_files)} total, "
                 f"{len(labeled_files)} labeled, {len(unlabeled_sc)} unlabeled")
 
-    # 2. Train audio files (discover secondary species not in existing labels)
+    # Train audio files (discover secondary species)
     audio_dir = data_dir / "train_audio"
     train_df = pd.read_csv(data_dir / "train.csv")
-    # Build set of known labels per file for filtering later
     known_labels_per_file = {}
     for _, row in train_df.iterrows():
         fn = row["filename"]
@@ -229,19 +192,17 @@ def main():
             pass
         known_labels_per_file[fn] = labels
 
-    # Collect train_audio files (they're in subdirectories like species/file.ogg)
     train_audio_files = sorted(train_df["filename"].values)
     logger.info(f"Train audio: {len(train_audio_files)} files to scan for secondary species")
 
     # --- Run inference ---
-    rows_soundscape = []  # pseudo-labels for soundscapes (new training data)
-    rows_train_audio = [] # discovered secondary species in train_audio
+    rows_soundscape = []
+    rows_train_audio = []
     n_segments_total = 0
     n_segments_kept = 0
     all_max_confs = []
     species_confs = {}
 
-    # Process unlabeled soundscapes
     for fn in tqdm(unlabeled_sc, desc="Pseudo-label soundscapes", mininterval=30):
         path = str(soundscape_dir / fn)
         try:
@@ -250,10 +211,7 @@ def main():
             logger.warning(f"Skipping {fn}: {e}")
             continue
 
-        segments, probs = predict_file(
-            model, audio, clip_samples, device,
-            batch_size=args.batch_size,
-        )
+        segments, probs = predict_file(model, audio, device, batch_size=args.batch_size)
 
         for (start_sec, end_sec), prob in zip(segments, probs):
             n_segments_total += 1
@@ -292,10 +250,7 @@ def main():
             logger.warning(f"Skipping {fn}: {e}")
             continue
 
-        segments, probs = predict_file(
-            model, audio, clip_samples, device,
-            batch_size=args.batch_size,
-        )
+        segments, probs = predict_file(model, audio, device, batch_size=args.batch_size)
 
         known = known_labels_per_file.get(fn, set())
         for (start_sec, end_sec), prob in zip(segments, probs):
@@ -305,7 +260,6 @@ def main():
             if len(above) == 0:
                 continue
 
-            # Only keep species NOT already labeled for this file
             novel = [i for i in above if idx_to_label[i] not in known]
             if not novel:
                 continue
@@ -347,7 +301,6 @@ def main():
     yield_rate = n_segments_kept / max(n_segments_total, 1)
     unique_species = sorted(species_confs.keys())
 
-    # Per-species stats
     per_species_stats = {}
     for sp in unique_species:
         confs = species_confs[sp]
@@ -357,16 +310,13 @@ def main():
             "min_conf": float(np.min(confs)),
         }
 
-    # Confidence histogram bins
     conf_hist_bins = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
     conf_hist_counts = np.histogram(all_max_confs, bins=conf_hist_bins)[0].tolist() if len(all_max_confs) > 0 else []
 
-    # Top/bottom species by count
     species_by_count = sorted(per_species_stats.items(), key=lambda x: -x[1]["count"])
     top10 = species_by_count[:10]
     bottom10 = species_by_count[-10:] if len(species_by_count) > 10 else []
 
-    # --- Log summary ---
     total_kept = len(rows_soundscape) + len(rows_train_audio)
     logger.info(f"\nPseudo-labeling complete:")
     logger.info(f"  Soundscape: {len(unlabeled_sc)} files, "
@@ -437,7 +387,6 @@ def main():
                 },
             )
 
-            # Log scalar metrics
             wandb.log({
                 "pseudo/total_segments": n_segments_total,
                 "pseudo/segments_kept": n_segments_kept,
@@ -446,7 +395,6 @@ def main():
                 "pseudo/species_coverage": len(unique_species) / max(num_classes, 1),
             })
 
-            # Log confidence histogram
             if len(all_max_confs) > 0:
                 wandb.log({
                     "pseudo/confidence_hist": wandb.Histogram(all_max_confs.tolist()),
@@ -454,7 +402,6 @@ def main():
                     "pseudo/median_max_conf": float(np.median(all_max_confs)),
                 })
 
-            # Log per-species table
             species_table = wandb.Table(
                 columns=["species", "count", "mean_conf", "min_conf"])
             for sp, stats in species_by_count:

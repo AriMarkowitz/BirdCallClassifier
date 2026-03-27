@@ -1,6 +1,6 @@
 """
 BirdCLEF 2026 — Kaggle Inference Notebook
-HTSAT-tiny fine-tuned on BirdCLEF 2026 training data.
+EfficientNet fine-tuned on BirdCLEF 2026 training data.
 Supports multi-model ensemble (averages predictions across all checkpoints).
 Includes temporal MLP for time-of-day and seasonality awareness.
 
@@ -21,8 +21,11 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torchaudio
+import torchaudio.transforms as T
 import soundfile as sf
 import librosa
+import timm
 
 # ── CPU optimization ──────────────────────────────────────────────────────────
 torch.set_num_threads(4)  # Kaggle has 4 CPU cores
@@ -50,157 +53,178 @@ assert COMPETITION_DATA, f"Competition data not found. /kaggle/input contains: {
 assert MODEL_DATASET, f"Model dataset not found. /kaggle/input contains: {os.listdir(_INPUT)}"
 
 # Find all checkpoints for ensemble
-CHECKPOINT_PATHS = sorted(glob.glob(os.path.join(MODEL_DATASET, "birdclef-htsat-*.ckpt")))
+CHECKPOINT_PATHS = sorted(glob.glob(os.path.join(MODEL_DATASET, "birdclef-enet-*.ckpt")))
 
-HTSAT_CODE_DIR = os.path.join(MODEL_DATASET, "htsat")
 NMF_W_PATH = os.path.join(MODEL_DATASET, "W_k56.npy")
 TAXONOMY_PATH = os.path.join(COMPETITION_DATA, "taxonomy.csv")
+
+# Add model code to path
+MODEL_CODE_DIR = os.path.join(MODEL_DATASET, "src")
+if os.path.isdir(MODEL_CODE_DIR):
+    sys.path.insert(0, MODEL_CODE_DIR)
 
 print(f"Competition data: {COMPETITION_DATA}")
 print(f"Model dataset: {MODEL_DATASET}")
 print(f"Checkpoints found: {len(CHECKPOINT_PATHS)}")
 for cp in CHECKPOINT_PATHS:
     print(f"  - {os.path.basename(cp)}")
-print(f"HTSAT code: {HTSAT_CODE_DIR}")
 print(f"NMF W matrix: {NMF_W_PATH}")
 print(f"Taxonomy: {TAXONOMY_PATH}")
 
 assert len(CHECKPOINT_PATHS) > 0, "No checkpoints found"
-assert os.path.isdir(HTSAT_CODE_DIR), f"HTSAT code dir not found: {HTSAT_CODE_DIR}"
-assert os.path.isfile(NMF_W_PATH), f"NMF W matrix not found: {NMF_W_PATH}"
-assert os.path.isfile(TAXONOMY_PATH), f"Taxonomy not found: {TAXONOMY_PATH}"
 
 TEST_SOUNDSCAPES = os.path.join(COMPETITION_DATA, "test_soundscapes")
 SAMPLE_SUB_PATH = os.path.join(COMPETITION_DATA, "sample_submission.csv")
 OUTPUT_PATH = "/kaggle/working/submission.csv"
 
-print(f"Test soundscapes dir exists: {os.path.isdir(TEST_SOUNDSCAPES)}")
-print(f"Sample submission exists: {os.path.isfile(SAMPLE_SUB_PATH)}")
-
 
 # ── Audio config (must match training) ─────────────────────────────────────────
 SAMPLE_RATE = 32000
 SEGMENT_SECONDS = 5
-CLIP_SECONDS = 10
-CLIP_SAMPLES = SAMPLE_RATE * CLIP_SECONDS
 SEGMENT_SAMPLES = SAMPLE_RATE * SEGMENT_SECONDS
-BATCH_SIZE = 8  # smaller batches for CPU memory efficiency
+BATCH_SIZE = 8
 TEMPORAL_DIM = 4
 
-# ── Stub out problematic imports before loading HTSAT code ─────────────────────
-for mod_name in ["h5py", "museval", "museval.metrics", "torchcontrib", "torchcontrib.optim"]:
-    if mod_name not in sys.modules:
-        sys.modules[mod_name] = types.ModuleType(mod_name)
-sys.modules["torchcontrib.optim"].SWA = type("SWA", (), {})
 
-# torchlibrosa shim: Kaggle doesn't have torchlibrosa, so we provide
-# lightweight replacements using torchaudio (which IS available).
-import torchaudio
-import torchaudio.transforms as _T
-
-class _Spectrogram(nn.Module):
-    """Drop-in replacement for torchlibrosa.stft.Spectrogram.
-    torchlibrosa returns (B, 1, time_steps, freq_bins)."""
-    def __init__(self, n_fft=2048, hop_length=None, win_length=None,
-                 window='hann', center=True, pad_mode='reflect',
-                 power=2.0, freeze_parameters=True):
-        super().__init__()
-        self.spec = _T.Spectrogram(
-            n_fft=n_fft, hop_length=hop_length, win_length=win_length,
-            power=power, center=center, pad_mode=pad_mode,
-        )
-    def forward(self, x):
-        # x: (B, 1, samples) or (B, samples)
-        if x.dim() == 3:
-            out = self.spec(x[:, 0])        # (B, freq, time)
-        else:
-            out = self.spec(x)              # (B, freq, time)
-        # Transpose to match torchlibrosa layout: (B, 1, time, freq)
-        return out.transpose(1, 2).unsqueeze(1)
-
-class _LogmelFilterBank(nn.Module):
-    """Drop-in replacement for torchlibrosa.stft.LogmelFilterBank.
-    Input/output layout: (B, 1, time_steps, freq/mel_bins)."""
-    def __init__(self, sr=22050, n_fft=2048, n_mels=64, fmin=0.0, fmax=None,
-                 is_log=True, ref=1.0, amin=1e-10, top_db=None,
-                 freeze_parameters=True):
-        super().__init__()
-        self.mel_scale = _T.MelScale(
-            n_mels=n_mels, sample_rate=sr, n_stft=n_fft // 2 + 1,
-            f_min=fmin, f_max=fmax, norm="slaney", mel_scale="htk",
-        )
-        self.is_log = is_log
-        self.ref = ref
-        self.amin = amin
-        self.top_db = top_db
-    def forward(self, x):
-        # x: (B, 1, time, freq) -> transpose to (B, 1, freq, time) for MelScale
-        x_ft = x.transpose(2, 3)           # (B, 1, freq, time)
-        mel = self.mel_scale(x_ft)          # (B, 1, mel, time)
-        if self.is_log:
-            mel = torch.log10(torch.clamp(mel, min=self.amin) / self.ref)
-            mel = mel * 10.0
-            if self.top_db is not None:
-                mel = torch.clamp(mel, min=mel.max() - self.top_db)
-        # Transpose back to (B, 1, time, mel)
-        return mel.transpose(2, 3)
-
-class _SpecAugmentation(nn.Module):
-    """No-op replacement for torchlibrosa.augmentation.SpecAugmentation.
-    Not needed at inference time."""
-    def __init__(self, **kwargs):
-        super().__init__()
-    def forward(self, x):
-        return x
-
-# Inject into sys.modules so `from torchlibrosa.stft import ...` works
-_tl = types.ModuleType("torchlibrosa")
-_tl_stft = types.ModuleType("torchlibrosa.stft")
-_tl_aug = types.ModuleType("torchlibrosa.augmentation")
-_tl_stft.Spectrogram = _Spectrogram
-_tl_stft.LogmelFilterBank = _LogmelFilterBank
-_tl_aug.SpecAugmentation = _SpecAugmentation
-_tl.stft = _tl_stft
-_tl.augmentation = _tl_aug
-sys.modules["torchlibrosa"] = _tl
-sys.modules["torchlibrosa.stft"] = _tl_stft
-sys.modules["torchlibrosa.augmentation"] = _tl_aug
-
-# Fix numpy 2.x: sed_model.py does `from numpy.lib.function_base import average`
+# ── Import model ──────────────────────────────────────────────────────────────
+# Try importing from model dataset, fall back to inline definition
 try:
-    from numpy.lib.function_base import average  # noqa: F401
-except (ImportError, ModuleNotFoundError):
-    if not hasattr(np.lib, "function_base"):
-        np.lib.function_base = types.ModuleType("numpy.lib.function_base")
-    np.lib.function_base.average = np.average
+    from model import BirdCLEFModel
+except ImportError:
+    # Inline model definition for Kaggle (self-contained)
+    def build_mel_extractor(sample_rate=32000, n_fft=1024, hop_length=320,
+                            n_mels=128, f_min=50.0, f_max=14000.0):
+        return nn.Sequential(
+            T.MelSpectrogram(
+                sample_rate=sample_rate, n_fft=n_fft, win_length=n_fft,
+                hop_length=hop_length, f_min=f_min, f_max=f_max,
+                n_mels=n_mels, window_fn=torch.hann_window,
+                power=2.0, center=True, pad_mode="reflect",
+            ),
+            T.AmplitudeToDB(stype="power", top_db=80),
+        )
 
-# Add HTSAT code to sys.path
-sys.path.insert(0, HTSAT_CODE_DIR)
-print(f"HTSAT code dir exists: {os.path.isdir(HTSAT_CODE_DIR)}")
+    def build_nmf_mel_extractor(sample_rate=32000, n_fft=1024, hop_length=320,
+                                 n_mels=64, f_min=50.0, f_max=14000.0):
+        return T.MelSpectrogram(
+            sample_rate=sample_rate, n_fft=n_fft, win_length=n_fft,
+            hop_length=hop_length, f_min=f_min, f_max=f_max,
+            n_mels=n_mels, window_fn=torch.hann_window,
+            power=2.0, center=True, pad_mode="reflect",
+        )
 
-import config as htsat_config
-from model.htsat import HTSAT_Swin_Transformer
+    class BirdCLEFModel(nn.Module):
+        def __init__(self, num_classes, backbone_name="tf_efficientnet_b0_ns",
+                     sample_rate=32000, n_fft=1024, hop_length=320,
+                     n_mels=128, f_min=50.0, f_max=14000.0,
+                     nmf_n_mels=64, W_path=None, pretrained=False):
+            super().__init__()
+            self.num_classes = num_classes
+            self.sample_rate = sample_rate
+            self.hop_length = hop_length
 
-# ── Config overrides (must match training) ─────────────────────────────────────
-NUM_CLASSES = 234
+            self.mel_extractor = build_mel_extractor(
+                sample_rate=sample_rate, n_fft=n_fft, hop_length=hop_length,
+                n_mels=n_mels, f_min=f_min, f_max=f_max,
+            )
 
-htsat_config.classes_num = NUM_CLASSES
-htsat_config.loss_type = "clip_bce"
-htsat_config.enable_tscam = True
-htsat_config.htsat_attn_heatmap = False
-htsat_config.enable_repeat_mode = False
+            self.backbone = timm.create_model(
+                backbone_name, pretrained=pretrained, in_chans=1,
+                num_classes=0, global_pool="",
+            )
+            backbone_dim = self.backbone.num_features
+
+            self.global_pool = nn.AdaptiveAvgPool2d(1)
+            self.head_drop = nn.Dropout(0.3)
+            self.head = nn.Linear(backbone_dim, num_classes)
+
+            self.freq_mask = T.FrequencyMasking(freq_mask_param=16)
+            self.time_mask = T.TimeMasking(time_mask_param=64)
+            self.bn0 = nn.BatchNorm2d(n_mels)
+
+            self.nmf_mel = build_nmf_mel_extractor(
+                sample_rate=sample_rate, n_fft=n_fft, hop_length=hop_length,
+                n_mels=nmf_n_mels, f_min=f_min, f_max=f_max,
+            )
+
+            if W_path and os.path.isfile(W_path):
+                _W = torch.from_numpy(np.load(W_path)).float()
+                self.register_buffer("W_nmf", _W)
+                self.nmf_k = _W.shape[1]
+            else:
+                self.register_buffer("W_nmf", None)
+                self.nmf_k = 0
+
+            nmf_feat_dim = 2 * self.nmf_k
+            if self.nmf_k > 0:
+                self.nmf_proj = nn.Linear(nmf_feat_dim, num_classes)
+            else:
+                self.nmf_proj = None
+
+            self.latent_dim = backbone_dim + nmf_feat_dim
+
+        @staticmethod
+        def _solve_nmf_h(V, W, num_iters=50, eps=1e-8):
+            B, F, T_time = V.shape
+            K = W.shape[1]
+            device, dtype = V.device, V.dtype
+            W = W.to(device=device, dtype=dtype)
+            H = torch.ones((B, K, T_time), device=device, dtype=dtype)
+            WT = W.T
+            WTW = WT @ W
+            WTV = torch.matmul(WT.unsqueeze(0), V)
+            for _ in range(num_iters):
+                denom = torch.matmul(WTW.unsqueeze(0), H) + eps
+                H = H * (WTV / denom)
+                H = torch.clamp(H, min=eps)
+            return H
+
+        @staticmethod
+        def _summarize_nmf_h(H):
+            return torch.cat([H.mean(dim=2), H.amax(dim=2)], dim=1)
+
+        def _nmf_features(self, x):
+            if self.W_nmf is None or self.nmf_k == 0:
+                return None
+            with torch.no_grad():
+                mel_pow = self.nmf_mel(x)
+                mel_pow = torch.clamp(mel_pow, min=1e-10)
+                H = self._solve_nmf_h(mel_pow, self.W_nmf)
+                return self._summarize_nmf_h(H)
+
+        def forward(self, x, mixup_lambda=None):
+            if x.dim() == 3 and x.shape[1] == 1:
+                x = x[:, 0, :]
+
+            nmf_feat = self._nmf_features(x)
+
+            mel = self.mel_extractor(x).unsqueeze(1)
+            mel = mel.squeeze(1).permute(0, 2, 1).unsqueeze(-1)
+            mel = self.bn0(mel)
+            mel = mel.squeeze(-1).unsqueeze(1).permute(0, 1, 3, 2)
+            mel = mel.permute(0, 1, 3, 2)
+
+            features = self.backbone(mel)
+            pooled = self.global_pool(features).flatten(1)
+
+            logits = self.head(self.head_drop(pooled))
+
+            if nmf_feat is not None and self.nmf_proj is not None:
+                nmf_logits = self.nmf_proj(nmf_feat)
+                logits = logits + nmf_logits
+                latent = torch.cat([pooled, nmf_feat], dim=1)
+            else:
+                latent = pooled
+
+            return {
+                "clipwise_output": torch.sigmoid(logits),
+                "latent_output": latent,
+            }
 
 
 # ── Temporal features ─────────────────────────────────────────────────────────
 def parse_temporal_features(filename):
-    """Extract cyclical temporal features from soundscape filename.
-
-    Filename format: BC2026_Test_0001_S05_20250227_010002.ogg
-                                          YYYYMMDD  HHMMSS
-
-    Returns np.float32 array of shape (4,):
-        [sin(2π·hour/24), cos(2π·hour/24), sin(2π·doy/365), cos(2π·doy/365)]
-    """
+    """Extract cyclical temporal features from soundscape filename."""
     m = re.search(r'_(\d{8})_(\d{6})', filename)
     if m is None:
         return np.zeros(TEMPORAL_DIM, dtype=np.float32)
@@ -248,14 +272,10 @@ def build_label_map(taxonomy_path):
 
 label_map, sorted_labels = build_label_map(TAXONOMY_PATH)
 NUM_CLASSES = len(label_map)
-htsat_config.classes_num = NUM_CLASSES
 print(f"Classes: {NUM_CLASSES}")
 
-# Read exact column order from sample submission
 sample_sub = pd.read_csv(SAMPLE_SUB_PATH, nrows=0)
 sub_columns = [c for c in sample_sub.columns if c != "row_id"]
-print(f"Submission columns: {len(sub_columns)}")
-
 assert len(sub_columns) == NUM_CLASSES, (
     f"Column count mismatch: {len(sub_columns)} vs {NUM_CLASSES}"
 )
@@ -264,18 +284,13 @@ col_to_model_idx = {lbl: label_map[lbl] for lbl in sub_columns}
 
 # ── Load model ─────────────────────────────────────────────────────────────────
 def load_model(checkpoint_path):
-    """Load HTSAT model and temporal MLP from checkpoint."""
-    model = HTSAT_Swin_Transformer(
-        spec_size=htsat_config.htsat_spec_size,
-        patch_size=htsat_config.htsat_patch_size,
-        patch_stride=htsat_config.htsat_stride,
+    """Load EfficientNet model and temporal MLP from checkpoint."""
+    model = BirdCLEFModel(
         num_classes=NUM_CLASSES,
-        embed_dim=htsat_config.htsat_dim,
-        depths=htsat_config.htsat_depth,
-        num_heads=htsat_config.htsat_num_head,
-        window_size=htsat_config.htsat_window_size,
-        config=htsat_config,
+        backbone_name="tf_efficientnet_b0_ns",
+        sample_rate=SAMPLE_RATE,
         W_path=NMF_W_PATH,
+        pretrained=False,
     )
 
     temporal_mlp = TemporalMLP(TEMPORAL_DIM, NUM_CLASSES)
@@ -283,14 +298,12 @@ def load_model(checkpoint_path):
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state_dict = ckpt["state_dict"]
 
-    # Load HTSAT weights (strip sed_model. prefix)
-    htsat_dict = {k.replace("sed_model.", ""): v
-                  for k, v in state_dict.items()
-                  if k.startswith("sed_model.")}
-    # strict=False: the torchlibrosa shim registers different buffer names
-    # (e.g. spec.window vs stft.conv_real) — these are frozen spectrogram
-    # params, not learned weights, so mismatches are harmless.
-    model.load_state_dict(htsat_dict, strict=False)
+    # Load model weights (strip model. prefix from Lightning wrapper)
+    model_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith("model."):
+            model_dict[k.replace("model.", "", 1)] = v
+    model.load_state_dict(model_dict, strict=False)
     model.eval()
 
     # Load temporal MLP weights if present
@@ -318,7 +331,6 @@ for cp in CHECKPOINT_PATHS:
     temporal_mlps.append(t)
 print(f"Loaded {len(models)} models for ensemble in {time.time() - t_load:.1f}s")
 
-# Pre-compute column index mapping once
 col_indices = np.array([col_to_model_idx[c] for c in sub_columns])
 
 
@@ -339,36 +351,29 @@ def load_audio(path):
 
 
 def segment_audio(audio):
-    """Split audio into 5s segments, each padded/tiled to 10s."""
+    """Split audio into 5s segments (no tiling — model handles variable length)."""
     n_segments = len(audio) // SEGMENT_SAMPLES
     if n_segments == 0:
         return None
-    segments = np.empty((n_segments, CLIP_SAMPLES), dtype=np.float32)
+    segments = np.empty((n_segments, SEGMENT_SAMPLES), dtype=np.float32)
     for i in range(n_segments):
-        seg = audio[i * SEGMENT_SAMPLES : (i + 1) * SEGMENT_SAMPLES]
-        # Tile 5s to 10s
-        segments[i] = np.tile(seg, 2)[:CLIP_SAMPLES]
+        segments[i] = audio[i * SEGMENT_SAMPLES : (i + 1) * SEGMENT_SAMPLES]
     return segments
-
 
 
 # ── Inference ──────────────────────────────────────────────────────────────────
 def predict_batch_ensemble(models, temporal_mlps, waveforms, temporal_features):
-    """Run inference with all models and average predictions.
-
-    Applies temporal MLP bias in logit space before averaging.
-    """
+    """Run inference with all models and average predictions."""
     x = torch.from_numpy(waveforms)
-    t = torch.from_numpy(temporal_features)  # (batch, 4)
+    t = torch.from_numpy(temporal_features)
     batch_size = len(waveforms)
     probs_sum = np.zeros((batch_size, NUM_CLASSES), dtype=np.float32)
     eps = 1e-6
 
     for model, temp_mlp in zip(models, temporal_mlps):
         output_dict = model(x)
-        clipwise = output_dict["clipwise_output"]  # sigmoided
+        clipwise = output_dict["clipwise_output"]
 
-        # Apply temporal bias in logit space
         logits = torch.log(clipwise.clamp(eps, 1 - eps) / (1 - clipwise.clamp(eps, 1 - eps)))
         temporal_bias = temp_mlp(t)
         probs = torch.sigmoid(logits + temporal_bias)
@@ -397,7 +402,6 @@ def main():
         fname = os.path.basename(filepath)
         fname_stem = os.path.splitext(fname)[0]
 
-        # Parse temporal features once per file (same for all segments)
         temporal = parse_temporal_features(fname)
 
         try:
@@ -413,13 +417,10 @@ def main():
         n_segments = len(segments)
         row_ids = [f"{fname_stem}_{(i + 1) * SEGMENT_SECONDS}" for i in range(n_segments)]
 
-        # Batch inference
         for batch_start in range(0, n_segments, BATCH_SIZE):
             batch = segments[batch_start : batch_start + BATCH_SIZE]
-            # Broadcast temporal features to batch size
             batch_temporal = np.tile(temporal, (len(batch), 1))
             probs = predict_batch_ensemble(models, temporal_mlps, batch, batch_temporal)
-            # Reorder columns to match submission format
             all_probs.append(probs[:, col_indices])
             all_row_ids.extend(row_ids[batch_start : batch_start + len(batch)])
 

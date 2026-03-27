@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=birdclef-htsat
+#SBATCH --job-name=birdclef-enet
 #SBATCH --partition=l40s
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -54,18 +54,6 @@ echo "---"
 
 cd "$PROJECT_DIR"
 
-# ── Download pretrained checkpoint if not present ──
-CKPT_DIR="$PROJECT_DIR/checkpoints"
-CKPT_PATH="$CKPT_DIR/HTSAT_AudioSet_Saved_1.ckpt"
-mkdir -p "$CKPT_DIR"
-
-if [ ! -f "$CKPT_PATH" ]; then
-    echo "Downloading AudioSet pretrained HTSAT checkpoint..."
-    pip install -q gdown
-    gdown "https://drive.google.com/uc?id=1OK8a5XuMVLyeVKF117L8pfxeZYdfSDZv" \
-        -O "$CKPT_PATH" || echo "WARNING: Checkpoint download failed. Will train from scratch."
-fi
-
 # ── Preprocess: detect active vocal regions (one-time, cached) ──
 VALID_REGIONS="$PROJECT_DIR/data/valid_regions.json"
 if [ ! -f "$VALID_REGIONS" ]; then
@@ -76,17 +64,18 @@ if [ ! -f "$VALID_REGIONS" ]; then
 fi
 
 # ── Fold, seed, and resume (override via environment) ──
-# Examples:
-#   FOLD=2 sbatch scripts/train.sh
-#   RESUME_FROM=checkpoints/313603_fold0/birdclef-htsat-epoch=05-val_macro_auc=0.8500.ckpt sbatch scripts/train.sh
 FOLD="${FOLD:-0}"
 SEED="${SEED:-42}"
 RESUME_FROM="${RESUME_FROM:-}"
 PSEUDO_LABELS="${PSEUDO_LABELS:-}"
+BACKBONE="${BACKBONE:-tf_efficientnet_b0_ns}"
+MIN_DURATION="${MIN_DURATION:-3.0}"
+MAX_DURATION="${MAX_DURATION:-30.0}"
 
 # ── Run training ──
 JOB_ID="${SLURM_JOB_ID:-local_$(date +%Y%m%d_%H%M%S)}"
 RUN_ID="${JOB_ID}_fold${FOLD}"
+CKPT_DIR="$PROJECT_DIR/checkpoints"
 
 RESUME_ARG=""
 if [ -n "$RESUME_FROM" ]; then
@@ -102,8 +91,8 @@ fi
 
 python src/train.py \
     --data_dir "$PROJECT_DIR/data" \
-    --checkpoint "$CKPT_PATH" \
-    --batch_size 128 \
+    --backbone "$BACKBONE" \
+    --batch_size 64 \
     --num_workers 8 \
     --max_epochs 25 \
     --lr 1e-4 \
@@ -115,9 +104,11 @@ python src/train.py \
     --fold "$FOLD" \
     --mix_prob 0.3 \
     --balance_alpha 0.5 \
+    --min_duration "$MIN_DURATION" \
+    --max_duration "$MAX_DURATION" \
     --use_wandb \
     --wandb_project birdclef-2026 \
-    --run_name "htsat-${RUN_ID}" \
+    --run_name "enet-${RUN_ID}" \
     --run_id "$RUN_ID" \
     --valid_regions "$VALID_REGIONS" \
     $RESUME_ARG \

@@ -1,16 +1,14 @@
 """
-Fine-tune HTSAT on BirdCLEF 2026 for multi-label classification.
+Fine-tune EfficientNet on BirdCLEF 2026 for multi-label classification.
 
 Usage:
-    python src/train.py --checkpoint path/to/HTSAT_AudioSet_Saved.ckpt
+    python src/train.py [--backbone tf_efficientnet_b0_ns] [--max_duration 30]
 
-Key adjustments from AudioSet defaults:
-  - classes_num: 234 (from taxonomy.csv)
-  - Warmup reduced: 1 epoch at 0.1x LR, then cosine decay
-  - Lower LR: 3e-5 default (fine-tuning, not training from scratch)
-  - Batch size: 32 (single GPU default)
-  - Site-based validation split for realistic eval
-  - WeightedRandomSampler to upweight soundscape data
+Key features:
+  - EfficientNet backbone (ImageNet-pretrained via timm)
+  - Variable-length audio input (3-30s default, padded per batch)
+  - NMF spectral branch (frozen dictionary → logit addition)
+  - SuMix augmentation, focal loss, class-balanced sampling
 """
 
 import os
@@ -25,14 +23,10 @@ import torch.nn as nn
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 
-# Add HTSAT source to path
 PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(PROJ_ROOT, "external", "htsat"))
 sys.path.insert(0, os.path.join(PROJ_ROOT, "src"))
 
-import config as htsat_config
-from model.htsat import HTSAT_Swin_Transformer
-from sed_model import SEDWrapper
+from model import BirdCLEFModel
 from torch.utils.data import DataLoader
 from dataset import get_dataloaders, get_datasets, build_label_map
 
@@ -45,10 +39,6 @@ class FocalLoss(nn.Module):
 
     Focuses training on hard examples by down-weighting easy negatives.
     With gamma=0 this is equivalent to standard BCE.
-
-    Args:
-        alpha: Weighting factor for positives (1-alpha for negatives).
-        gamma: Focusing parameter — higher values down-weight easy examples more.
     """
 
     def __init__(self, alpha: float = 0.25, gamma: float = 2.0):
@@ -64,80 +54,15 @@ class FocalLoss(nn.Module):
         return (focal_weight * bce).mean()
 
 
-def load_pretrained_htsat(checkpoint_path, config, num_classes):
-    """
-    Load an AudioSet-pretrained HTSAT checkpoint and replace the
-    classification head for `num_classes`.
-    """
-    # Build model with original 527 classes to load weights
-    model_527 = HTSAT_Swin_Transformer(
-        spec_size=config.htsat_spec_size,
-        patch_size=config.htsat_patch_size,
-        patch_stride=config.htsat_stride,
-        num_classes=527,
-        embed_dim=config.htsat_dim,
-        depths=config.htsat_depth,
-        num_heads=config.htsat_num_head,
-        window_size=config.htsat_window_size,
-        config=config,
-    )
-
-    if checkpoint_path and os.path.isfile(checkpoint_path):
-        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        if "state_dict" in ckpt:
-            state_dict = ckpt["state_dict"]
-            state_dict = {
-                k.replace("sed_model.", ""): v
-                for k, v in state_dict.items()
-            }
-        else:
-            state_dict = ckpt
-
-        filtered = {
-            k: v for k, v in state_dict.items()
-            if "head" not in k and "tscam_conv" not in k and "nmf_proj" not in k
-        }
-        missing, unexpected = model_527.load_state_dict(filtered, strict=False)
-        logger.info(f"Loaded pretrained weights. Missing: {len(missing)}, "
-                    f"Unexpected: {len(unexpected)}")
-    else:
-        logger.warning("No checkpoint provided — training from scratch.")
-
-    # Rebuild with correct num_classes
-    model = HTSAT_Swin_Transformer(
-        spec_size=config.htsat_spec_size,
-        patch_size=config.htsat_patch_size,
-        patch_stride=config.htsat_stride,
-        num_classes=num_classes,
-        embed_dim=config.htsat_dim,
-        depths=config.htsat_depth,
-        num_heads=config.htsat_num_head,
-        window_size=config.htsat_window_size,
-        config=config,
-    )
-
-    # Copy backbone weights
-    src_dict = model_527.state_dict()
-    tgt_dict = model.state_dict()
-    for k in tgt_dict:
-        if "head" not in k and "tscam_conv" not in k and "nmf_proj" not in k and k in src_dict:
-            tgt_dict[k] = src_dict[k]
-    model.load_state_dict(tgt_dict)
-    logger.info(f"Head replaced: 527 -> {num_classes} classes")
-
-    return model
-
-
 class BirdCLEFWrapper(pl.LightningModule):
-    """Lightning wrapper for HTSAT fine-tuning on BirdCLEF."""
+    """Lightning wrapper for EfficientNet fine-tuning on BirdCLEF."""
 
-    def __init__(self, sed_model, config, num_classes, learning_rate=1e-4,
+    def __init__(self, model, num_classes, learning_rate=1e-4,
                  warmup_epochs=1, max_epochs=30,
                  loss_type="bce", focal_alpha=0.25, focal_gamma=2.0,
                  mixup_alpha=0.4, idx_to_label=None):
         super().__init__()
-        self.sed_model = sed_model
-        self.config = config
+        self.model = model
         self.num_classes = num_classes
         self.learning_rate = learning_rate
         self.warmup_epochs = warmup_epochs
@@ -153,13 +78,12 @@ class BirdCLEFWrapper(pl.LightningModule):
         if mixup_alpha > 0:
             logger.info(f"SuMix enabled: alpha={mixup_alpha}")
 
-    def forward(self, x, mix_lambda=None):
-        output_dict = self.sed_model(x, mix_lambda)
-        clipwise = output_dict["clipwise_output"]  # already sigmoided
-        return clipwise, output_dict["framewise_output"]
+    def forward(self, x):
+        output_dict = self.model(x)
+        return output_dict["clipwise_output"]
 
     def _safe_loss(self, pred, target):
-        """Clamp predictions to [eps, 1-eps] and compute BCE in fp32."""
+        """Clamp predictions to [eps, 1-eps] and compute loss in fp32."""
         with torch.amp.autocast("cuda", enabled=False):
             pred = pred.float().clamp(1e-6, 1.0 - 1e-6)
             target = target.float()
@@ -170,9 +94,6 @@ class BirdCLEFWrapper(pl.LightningModule):
 
         Waveform: anchor + (1-lam) * shuffled (additive, not convex).
         Target: element-wise max of (anchor_target, (1-lam) * shuffled_target).
-        This ensures the anchor labels stay at full strength while the secondary
-        labels are scaled by their actual gain — a species mixed at 10% gain
-        gets a 0.1 target, not 1.0.
         """
         if self.mixup_alpha <= 0:
             return waveform, target
@@ -183,10 +104,7 @@ class BirdCLEFWrapper(pl.LightningModule):
         batch_size = waveform.size(0)
         perm = torch.randperm(batch_size, device=waveform.device)
 
-        # Additive waveform mix: anchor stays at full gain, secondary scaled
         waveform_mixed = waveform + (1.0 - lam) * waveform[perm]
-        # Anchor labels stay at full strength; secondary labels scaled by
-        # their mixing gain so the target reflects actual audibility
         target_mixed = torch.maximum(target, (1.0 - lam) * target[perm])
 
         return waveform_mixed, target_mixed
@@ -195,11 +113,10 @@ class BirdCLEFWrapper(pl.LightningModule):
         waveform = batch["waveform"]
         target = batch["target"]
 
-        # Apply SuMix batch-level augmentation
         if self.training and self.mixup_alpha > 0:
             waveform, target = self._sumix(waveform, target)
 
-        pred, _ = self(waveform)
+        pred = self(waveform)
         loss = self._safe_loss(pred, target)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         if batch_idx % 50 == 0:
@@ -208,10 +125,9 @@ class BirdCLEFWrapper(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        pred, _ = self(batch["waveform"])
+        pred = self(batch["waveform"])
         loss = self._safe_loss(pred, batch["target"])
         self.log("val_loss", loss, on_epoch=True, prog_bar=True)
-        # Accumulate for epoch-end AUC computation
         if not hasattr(self, "_val_preds"):
             self._val_preds = []
             self._val_targets = []
@@ -230,7 +146,6 @@ class BirdCLEFWrapper(pl.LightningModule):
         self._val_preds.clear()
         self._val_targets.clear()
 
-        # Per-class AUC (only for classes with positive samples in val)
         per_class_auc = {}
         col_mask = targets.sum(axis=0) > 0
         for i in range(self.num_classes):
@@ -243,7 +158,6 @@ class BirdCLEFWrapper(pl.LightningModule):
             except Exception:
                 pass
 
-        # Macro AUC
         try:
             if col_mask.any():
                 macro_auc = roc_auc_score(
@@ -259,7 +173,6 @@ class BirdCLEFWrapper(pl.LightningModule):
         logger.info(f"Epoch {self.current_epoch}: val_macro_auc={macro_auc:.4f} "
                      f"({len(per_class_auc)} evaluable classes)")
 
-        # Log top-10 best and worst per-class AUCs
         if per_class_auc:
             sorted_aucs = sorted(per_class_auc.items(), key=lambda x: x[1])
             worst10 = sorted_aucs[:10]
@@ -270,11 +183,9 @@ class BirdCLEFWrapper(pl.LightningModule):
             logger.info(f"  Best 10 AUC: " +
                          ", ".join(f"{sp}={auc:.3f}" for sp, auc in best10))
 
-            # Store for W&B (logged via self.logger if available)
             if self.logger and hasattr(self.logger, "experiment"):
                 try:
                     import wandb
-                    # Log worst/best as a summary table each epoch
                     table = wandb.Table(columns=["species", "auc", "rank"])
                     for rank, (sp, auc) in enumerate(sorted_aucs):
                         table.add_data(sp, round(auc, 4), rank + 1)
@@ -286,7 +197,7 @@ class BirdCLEFWrapper(pl.LightningModule):
                             [v for v in per_class_auc.values()])),
                     })
                 except Exception:
-                    pass  # W&B not available or not configured
+                    pass
 
     def configure_optimizers(self):
         params = filter(lambda p: p.requires_grad, self.parameters())
@@ -300,7 +211,6 @@ class BirdCLEFWrapper(pl.LightningModule):
         )
 
         return optimizer
-
 
 
 def _load_pseudo_label_summary(pseudo_labels_csv):
@@ -327,12 +237,14 @@ def _load_pseudo_label_summary(pseudo_labels_csv):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fine-tune HTSAT on BirdCLEF 2026")
+    parser = argparse.ArgumentParser(description="Fine-tune EfficientNet on BirdCLEF 2026")
     parser.add_argument("--data_dir", type=str,
                         default=os.path.join(PROJ_ROOT, "data"))
-    parser.add_argument("--checkpoint", type=str, default=None,
-                        help="Path to AudioSet pretrained HTSAT checkpoint")
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--backbone", type=str, default="tf_efficientnet_b0_ns",
+                        help="timm backbone name (default: tf_efficientnet_b0_ns)")
+    parser.add_argument("--n_mels", type=int, default=128,
+                        help="Number of mel bins for backbone spectrogram")
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -343,65 +255,47 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume_from", type=str, default=None,
                         help="Path to Lightning checkpoint to resume training from")
-    parser.add_argument("--label_smoothing", type=float, default=0.1,
-                        help="Label smoothing factor (0=hard labels, 0.1=recommended)")
-    parser.add_argument("--loss", type=str, default="bce", choices=["bce", "focal"],
-                        help="Loss function: 'bce' or 'focal'")
-    parser.add_argument("--focal_alpha", type=float, default=0.25,
-                        help="Focal loss alpha (positive class weight)")
-    parser.add_argument("--focal_gamma", type=float, default=2.0,
-                        help="Focal loss gamma (focusing parameter)")
-    parser.add_argument("--use_wandb", action="store_true",
-                        help="Enable Weights & Biases logging")
-    parser.add_argument("--wandb_project", type=str, default="birdclef-2026",
-                        help="W&B project name")
-    parser.add_argument("--run_name", type=str, default=None,
-                        help="W&B run name (defaults to auto-generated)")
-    parser.add_argument("--run_id", type=str, default=None,
-                        help="Run ID for checkpoint subdir (defaults to seed<N>)")
-    parser.add_argument("--n_folds", type=int, default=5,
-                        help="Number of CV folds")
-    parser.add_argument("--fold", type=int, default=0,
-                        help="Which fold to hold out for validation (0 to n_folds-1)")
-    parser.add_argument("--multi_mix", action="store_true", default=True,
-                        help="Enable multi-species mixing augmentation on train_audio")
-    parser.add_argument("--no_multi_mix", action="store_false", dest="multi_mix",
-                        help="Disable multi-species mixing augmentation")
-    parser.add_argument("--mix_prob", type=float, default=0.7,
-                        help="Probability of multi-species mixing per sample")
-    parser.add_argument("--mixup_alpha", type=float, default=0.4,
-                        help="Beta distribution alpha for SuMix (0=disabled)")
-    parser.add_argument("--preload", action="store_true",
-                        help="Preload all train_audio waveforms into RAM (~34GB) for faster mixing")
-    parser.add_argument("--valid_regions", type=str, default=None,
-                        help="Path to valid_regions.json from preprocess_activity.py")
-    parser.add_argument("--pseudo_labels", type=str, default=None,
-                        help="Path to pseudo_labels.csv from pseudo_label.py")
-    parser.add_argument("--balance_alpha", type=float, default=0.5,
-                        help="Class-balance strength: 0=uniform, 0.5=sqrt(inv-freq), 1=full inv-freq")
+    parser.add_argument("--label_smoothing", type=float, default=0.1)
+    parser.add_argument("--loss", type=str, default="bce", choices=["bce", "focal"])
+    parser.add_argument("--focal_alpha", type=float, default=0.25)
+    parser.add_argument("--focal_gamma", type=float, default=2.0)
+    parser.add_argument("--use_wandb", action="store_true")
+    parser.add_argument("--wandb_project", type=str, default="birdclef-2026")
+    parser.add_argument("--run_name", type=str, default=None)
+    parser.add_argument("--run_id", type=str, default=None)
+    parser.add_argument("--n_folds", type=int, default=5)
+    parser.add_argument("--fold", type=int, default=0)
+    parser.add_argument("--multi_mix", action="store_true", default=True)
+    parser.add_argument("--no_multi_mix", action="store_false", dest="multi_mix")
+    parser.add_argument("--mix_prob", type=float, default=0.7)
+    parser.add_argument("--mixup_alpha", type=float, default=0.4)
+    parser.add_argument("--preload", action="store_true")
+    parser.add_argument("--valid_regions", type=str, default=None)
+    parser.add_argument("--pseudo_labels", type=str, default=None)
+    parser.add_argument("--balance_alpha", type=float, default=0.5)
+    parser.add_argument("--min_duration", type=float, default=3.0,
+                        help="Minimum clip duration in seconds")
+    parser.add_argument("--max_duration", type=float, default=30.0,
+                        help="Maximum clip duration in seconds")
     args = parser.parse_args()
 
     pl.seed_everything(args.seed)
-
-    # Use tensor cores for fp32 matmuls (L40S has them)
     torch.set_float32_matmul_precision("medium")
 
-    # Patch config for our dataset
-    htsat_config.classes_num = len(
-        build_label_map(os.path.join(args.data_dir, "taxonomy.csv"))
-    )
-    htsat_config.loss_type = "clip_bce"
-    htsat_config.enable_tscam = True
+    label_map = build_label_map(os.path.join(args.data_dir, "taxonomy.csv"))
+    num_classes = len(label_map)
 
-    logger.info(f"=== Full model training ===")
+    logger.info(f"=== EfficientNet training (backbone={args.backbone}) ===")
+    logger.info(f"Variable-length input: {args.min_duration}s - {args.max_duration}s")
 
     # Build dataloaders
     train_loader, val_loader, label_map, num_classes, n_train_audio = get_dataloaders(
         args.data_dir,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        sample_rate=htsat_config.sample_rate,
-        clip_duration=htsat_config.clip_samples / htsat_config.sample_rate,
+        sample_rate=32000,
+        min_duration=args.min_duration,
+        max_duration=args.max_duration,
         val_frac=args.val_frac,
         seed=args.seed,
         label_smoothing=args.label_smoothing,
@@ -418,11 +312,18 @@ def main():
                 f"Val batches: {len(val_loader)}")
 
     # Build model
-    htsat_config.classes_num = num_classes
-    model = load_pretrained_htsat(args.checkpoint, htsat_config, num_classes)
+    model = BirdCLEFModel(
+        num_classes=num_classes,
+        backbone_name=args.backbone,
+        sample_rate=32000,
+        n_mels=args.n_mels,
+        pretrained=True,
+    )
+    logger.info(f"Model params: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
+
     idx_to_label = {v: k for k, v in label_map.items()}
     wrapper = BirdCLEFWrapper(
-        model, htsat_config, num_classes,
+        model, num_classes,
         learning_rate=args.lr,
         warmup_epochs=args.warmup_epochs,
         max_epochs=args.max_epochs,
@@ -439,17 +340,15 @@ def main():
     os.makedirs(run_save_dir, exist_ok=True)
     logger.info(f"Checkpoints will be saved to: {run_save_dir}")
 
-    # Callbacks
     ckpt_callback = ModelCheckpoint(
         dirpath=run_save_dir,
-        filename="birdclef-htsat-{epoch:02d}-{val_macro_auc:.4f}",
+        filename="birdclef-enet-{epoch:02d}-{val_macro_auc:.4f}",
         monitor="val_macro_auc",
         mode="max",
         save_top_k=5,
     )
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
 
-    # Logger
     loggers = []
     if args.use_wandb:
         from pytorch_lightning.loggers import WandbLogger
@@ -466,7 +365,8 @@ def main():
                 "label_smoothing": args.label_smoothing,
                 "fold": args.fold,
                 "n_folds": args.n_folds,
-                "model": "htsat-tiny",
+                "model": args.backbone,
+                "n_mels": args.n_mels,
                 "loss": args.loss,
                 "focal_alpha": args.focal_alpha,
                 "focal_gamma": args.focal_gamma,
@@ -475,6 +375,8 @@ def main():
                 "mixup_alpha": args.mixup_alpha,
                 "pseudo_labels": args.pseudo_labels,
                 "balance_alpha": args.balance_alpha,
+                "min_duration": args.min_duration,
+                "max_duration": args.max_duration,
                 "n_train_audio": n_train_audio,
                 **_load_pseudo_label_summary(args.pseudo_labels),
             },
@@ -491,7 +393,7 @@ def main():
         log_every_n_steps=50,
         precision=32,
         enable_progress_bar=False,
-        num_sanity_val_steps=0,  # skip partial sanity check (misleading AUC on subset)
+        num_sanity_val_steps=0,
     )
 
     trainer.fit(wrapper, train_loader, val_loader, ckpt_path=args.resume_from)
