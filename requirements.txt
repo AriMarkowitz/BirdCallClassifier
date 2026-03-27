@@ -6,6 +6,8 @@ torchaudio
 
 # Model backbone
 timm>=1.0.0
+transformers>=4.40.0
+safetensors>=0.4.0
 
 # Training
 pytorch_lightning>=1.9.0,<2.0

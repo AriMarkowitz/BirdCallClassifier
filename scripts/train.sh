@@ -54,6 +54,9 @@ echo "---"
 
 cd "$PROJECT_DIR"
 
+# Reduce allocator fragmentation on long variable-length batches
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+
 # ── Preprocess: detect active vocal regions (one-time, cached) ──
 VALID_REGIONS="$PROJECT_DIR/data/valid_regions.json"
 if [ ! -f "$VALID_REGIONS" ]; then
@@ -68,9 +71,19 @@ FOLD="${FOLD:-0}"
 SEED="${SEED:-42}"
 RESUME_FROM="${RESUME_FROM:-}"
 PSEUDO_LABELS="${PSEUDO_LABELS:-}"
-BACKBONE="${BACKBONE:-tf_efficientnet_b0_ns}"
+BIRDSET_MODEL="${BIRDSET_MODEL:-DBD-research-group/EfficientNet-B1-BirdSet-XCL}"
 MIN_DURATION="${MIN_DURATION:-3.0}"
 MAX_DURATION="${MAX_DURATION:-30.0}"
+FULL_FILES="${FULL_FILES:-1}"
+MIX_PROB="${MIX_PROB:-0.0}"
+MIXUP_ALPHA="${MIXUP_ALPHA:-0.0}"
+DISTILL="${DISTILL:-1}"
+DISTILL_WEIGHT="${DISTILL_WEIGHT:-0.15}"
+DISTILL_TEMP="${DISTILL_TEMP:-2.0}"
+MAX_TIME_FRAMES="${MAX_TIME_FRAMES:-768}"
+CHUNK_HOP_FRAMES="${CHUNK_HOP_FRAMES:-512}"
+PRECISION="${PRECISION:-bf16}"
+BATCH_SIZE="${BATCH_SIZE:-16}"
 
 # ── Run training ──
 JOB_ID="${SLURM_JOB_ID:-local_$(date +%Y%m%d_%H%M%S)}"
@@ -89,20 +102,38 @@ if [ -n "$PSEUDO_LABELS" ]; then
     PSEUDO_ARG="--pseudo_labels $PSEUDO_LABELS"
 fi
 
+FULL_FILES_ARG=""
+if [ "$FULL_FILES" = "1" ]; then
+    echo "Full-file mode enabled: training on complete train_audio recordings"
+    FULL_FILES_ARG="--full_files"
+fi
+
+DISTILL_ARG="--no_distill"
+if [ "$DISTILL" = "1" ]; then
+    DISTILL_ARG="--distill"
+fi
+
 python src/train.py \
     --data_dir "$PROJECT_DIR/data" \
-    --backbone "$BACKBONE" \
-    --batch_size 64 \
+    --birdset_model_name "$BIRDSET_MODEL" \
+    --batch_size "$BATCH_SIZE" \
     --num_workers 8 \
     --max_epochs 25 \
-    --lr 1e-4 \
+    --lr 5e-5 \
+    --precision "$PRECISION" \
+    --max_time_frames "$MAX_TIME_FRAMES" \
+    --chunk_hop_frames "$CHUNK_HOP_FRAMES" \
     --save_dir "$CKPT_DIR" \
     --seed "$SEED" \
     --loss focal \
-    --label_smoothing 0.1 \
+    --label_smoothing 0.05 \
     --n_folds 5 \
     --fold "$FOLD" \
-    --mix_prob 0.3 \
+    --mix_prob "$MIX_PROB" \
+    --mixup_alpha "$MIXUP_ALPHA" \
+    --distill_weight "$DISTILL_WEIGHT" \
+    --distill_temperature "$DISTILL_TEMP" \
+    $DISTILL_ARG \
     --balance_alpha 0.5 \
     --min_duration "$MIN_DURATION" \
     --max_duration "$MAX_DURATION" \
@@ -111,6 +142,7 @@ python src/train.py \
     --run_name "enet-${RUN_ID}" \
     --run_id "$RUN_ID" \
     --valid_regions "$VALID_REGIONS" \
+    $FULL_FILES_ARG \
     $RESUME_ARG \
     $PSEUDO_ARG
 

@@ -78,7 +78,9 @@ class TrainAudioDataset(Dataset):
     Loads individual species recordings from train_audio/.
     Each audio file maps to one primary_label (single-label, stored as multi-hot).
 
-    Returns variable-length waveforms between min_duration and max_duration.
+    Returns variable-length waveforms between min_duration and max_duration,
+    unless full_files=True (then full recordings are returned, padded only to
+    min_duration for very short clips).
     When preload=True, all waveforms are loaded into RAM (cropped to max_duration).
     """
 
@@ -86,12 +88,13 @@ class TrainAudioDataset(Dataset):
                  min_duration=DEFAULT_MIN_DURATION,
                  max_duration=DEFAULT_MAX_DURATION,
                  label_smoothing=0.0, preload=False,
-                 valid_regions=None):
+                 valid_regions=None, full_files=False):
         self.audio_dir = audio_dir
         self.label_map = label_map
         self.sample_rate = sample_rate
         self.min_samples = int(sample_rate * min_duration)
         self.max_samples = int(sample_rate * max_duration)
+        self.full_files = full_files
         self.num_classes = len(label_map)
         self.label_smoothing = label_smoothing
         self.preload = preload
@@ -105,7 +108,7 @@ class TrainAudioDataset(Dataset):
         # Valid vocal regions per file (from preprocess_activity.py)
         # Maps filename -> list of (start_sample, end_sample) tuples
         self._valid_regions = {}
-        if valid_regions is not None:
+        if valid_regions is not None and not self.full_files:
             n_with_regions = 0
             for fn in self.filenames:
                 if fn in valid_regions:
@@ -153,15 +156,21 @@ class TrainAudioDataset(Dataset):
 
         Uses valid_regions if available to crop from active vocal regions.
         """
-        logger.info(f"Preloading {len(self.filenames)} audio files into RAM "
-                     f"(capped at {self.max_samples} samples = "
-                     f"{self.max_samples / self.sample_rate:.1f}s)...")
+        if self.full_files:
+            logger.info(f"Preloading {len(self.filenames)} full audio files into RAM...")
+        else:
+            logger.info(f"Preloading {len(self.filenames)} audio files into RAM "
+                        f"(capped at {self.max_samples} samples = "
+                        f"{self.max_samples / self.sample_rate:.1f}s)...")
         waveforms = []
         for i, fn in enumerate(self.filenames):
             path = os.path.join(self.audio_dir, fn)
             audio = self._load_audio_raw(path)
-            regions = self._valid_regions.get(fn)
-            audio = self._crop_from_regions(audio, regions)
+            if self.full_files:
+                audio = self._fit_min_only(audio)
+            else:
+                regions = self._valid_regions.get(fn)
+                audio = self._crop_from_regions(audio, regions)
             waveforms.append(audio)
             if (i + 1) % 5000 == 0:
                 logger.info(f"  Preloaded {i + 1}/{len(self.filenames)}")
@@ -192,8 +201,11 @@ class TrainAudioDataset(Dataset):
         else:
             filepath = os.path.join(self.audio_dir, self.filenames[index])
             audio = self._load_audio_raw(filepath)
-            regions = self._valid_regions.get(self.filenames[index])
-            waveform = self._crop_from_regions(audio, regions)
+            if self.full_files:
+                waveform = self._fit_min_only(audio)
+            else:
+                regions = self._valid_regions.get(self.filenames[index])
+                waveform = self._crop_from_regions(audio, regions)
         return {
             "waveform": waveform,
             "target": self._targets[index].copy(),
@@ -247,6 +259,16 @@ class TrainAudioDataset(Dataset):
         else:
             # Already in [min_samples, max_samples] — return as-is
             return audio.copy().astype(np.float32)
+
+    def _fit_min_only(self, audio):
+        """Return full audio, capped at max_samples, padded if shorter than min_samples."""
+        if len(audio) > self.max_samples:
+            start = np.random.randint(0, len(audio) - self.max_samples)
+            audio = audio[start:start + self.max_samples]
+        if len(audio) < self.min_samples:
+            pad = np.zeros(self.min_samples - len(audio), dtype=np.float32)
+            return np.concatenate([audio, pad]).astype(np.float32)
+        return audio.copy().astype(np.float32)
 
 
 class MultiSpeciesMixDataset(Dataset):
@@ -399,7 +421,8 @@ def get_datasets(data_dir, sample_rate=32000,
                  val_frac=0.25,
                  seed=42, label_smoothing=0.0, n_folds=5, fold=0,
                  multi_mix=True, mix_prob=0.7, preload=False,
-                 valid_regions_path=None, pseudo_labels_csv=None):
+                 valid_regions_path=None, pseudo_labels_csv=None,
+                 full_files=True):
     """
     Build train/val datasets with k-fold CV.
 
@@ -413,6 +436,8 @@ def get_datasets(data_dir, sample_rate=32000,
     Args:
         min_duration: minimum clip duration in seconds (shorter clips padded)
         max_duration: maximum clip duration in seconds (longer clips cropped)
+        full_files: if True, use full train_audio files (no max-duration crop,
+                no valid-region sub-cropping)
         n_folds: number of CV folds (default 5)
         fold: which fold to hold out for validation (0 to n_folds-1)
         multi_mix: enable multi-species mixing augmentation on train_audio
@@ -434,7 +459,9 @@ def get_datasets(data_dir, sample_rate=32000,
     # Load valid vocal regions if available
     import json
     valid_regions = None
-    if valid_regions_path and os.path.isfile(valid_regions_path):
+    if full_files and valid_regions_path:
+        logger.info("full_files=True: ignoring valid_regions cropping for train_audio")
+    elif valid_regions_path and os.path.isfile(valid_regions_path):
         with open(valid_regions_path) as f:
             valid_regions = json.load(f)
         logger.info(f"Loaded valid regions from {valid_regions_path} "
@@ -451,6 +478,7 @@ def get_datasets(data_dir, sample_rate=32000,
         max_duration=max_duration,
         label_smoothing=label_smoothing, preload=preload,
         valid_regions=valid_regions,
+        full_files=full_files,
     )
     # Val dataset: hard labels, shares preloaded waveforms to avoid double RAM
     audio_ds_val_hard = TrainAudioDataset(
@@ -460,6 +488,7 @@ def get_datasets(data_dir, sample_rate=32000,
         max_duration=max_duration,
         label_smoothing=0.0, preload=False,
         valid_regions=valid_regions,
+        full_files=full_files,
     )
     if preload and audio_ds_full._waveforms is not None:
         audio_ds_val_hard._waveforms = audio_ds_full._waveforms
@@ -720,7 +749,8 @@ def get_dataloaders(data_dir, batch_size=32, num_workers=4, sample_rate=32000,
                     label_smoothing=0.0,
                     n_folds=5, fold=0, multi_mix=True, mix_prob=0.7,
                     preload=False, valid_regions_path=None,
-                    pseudo_labels_csv=None, balance_alpha=0.5):
+                    pseudo_labels_csv=None, balance_alpha=0.5,
+                    full_files=True):
     """
     Convenience function returning DataLoaders ready for training.
 
@@ -734,6 +764,7 @@ def get_dataloaders(data_dir, batch_size=32, num_workers=4, sample_rate=32000,
         n_folds=n_folds, fold=fold, multi_mix=multi_mix, mix_prob=mix_prob,
         preload=preload, valid_regions_path=valid_regions_path,
         pseudo_labels_csv=pseudo_labels_csv,
+        full_files=full_files,
     )
 
     sampler = _build_class_balanced_sampler(

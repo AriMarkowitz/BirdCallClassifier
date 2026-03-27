@@ -1,148 +1,136 @@
 """
-EfficientNet-based model for BirdCLEF 2026 multi-label bird call classification.
+BirdSet-EfficientNet-based model for BirdCLEF multi-label bird call classification.
 
 Architecture:
-  - EfficientNet-B0 backbone (ImageNet-pretrained via timm) operating on
-    log-mel spectrograms. Fully convolutional — accepts any time dimension.
-  - NMF branch: frozen spectral dictionary projected to class logits,
-    added to backbone logits before final sigmoid.
-  - AdaptiveAvgPool2d(1) before the classifier head so variable-length
-    spectrograms are supported natively.
+  - BirdSet pretrained EfficientNet-B1 backbone from Hugging Face
+    (DBD-research-group/EfficientNet-B1-BirdSet-XCL).
+  - BirdSet-compatible log-mel frontend (32kHz, n_fft=2048, hop=256, n_mels=256,
+    power->dB, mean/std normalization).
+  - Task head projects BirdSet logits to BirdCLEF target classes.
 
-Input: raw waveform tensor of shape (B, num_samples) — variable length
-       within a batch is handled by the collate function padding to the
-       longest clip and a length mask.
-Output dict: {"clipwise_output": (B, num_classes), "latent_output": (B, D)}
+Input: raw waveform tensor (B, T) or (B, 1, T) with variable T. The collate
+       function pads within-batch to max length; model remains fully convolutional
+       over time and supports variable-length inputs.
+Output dict: {
+    "clipwise_output": (B, num_classes),
+    "latent_output": (B, birdset_num_classes),
+    "student_birdset_logits": (B, birdset_num_classes),
+}
 """
 
-import os
-import math
-
-import numpy as np
 import torch
 import torch.nn as nn
-import torchaudio
 import torchaudio.transforms as T
-import timm
 
-
-def build_mel_extractor(sample_rate=32000, n_fft=1024, hop_length=320,
-                        n_mels=128, f_min=50.0, f_max=14000.0):
-    """Log-mel spectrogram extractor for the CNN backbone."""
-    return nn.Sequential(
-        T.MelSpectrogram(
-            sample_rate=sample_rate,
-            n_fft=n_fft,
-            win_length=n_fft,
-            hop_length=hop_length,
-            f_min=f_min,
-            f_max=f_max,
-            n_mels=n_mels,
-            window_fn=torch.hann_window,
-            power=2.0,
-            center=True,
-            pad_mode="reflect",
-        ),
-        T.AmplitudeToDB(stype="power", top_db=80),
-    )
-
-
-def build_nmf_mel_extractor(sample_rate=32000, n_fft=1024, hop_length=320,
-                             n_mels=64, f_min=50.0, f_max=14000.0):
-    """Power mel spectrogram for NMF (must match the dictionary's mel config)."""
-    return T.MelSpectrogram(
-        sample_rate=sample_rate,
-        n_fft=n_fft,
-        win_length=n_fft,
-        hop_length=hop_length,
-        f_min=f_min,
-        f_max=f_max,
-        n_mels=n_mels,
-        window_fn=torch.hann_window,
-        power=2.0,
-        center=True,
-        pad_mode="reflect",
-    )
+try:
+    from transformers import EfficientNetForImageClassification
+except Exception as exc:
+    EfficientNetForImageClassification = None
+    _TRANSFORMERS_IMPORT_ERROR = exc
+else:
+    _TRANSFORMERS_IMPORT_ERROR = None
 
 
 class BirdCLEFModel(nn.Module):
-    """EfficientNet + NMF for multi-label bird species classification.
+    """BirdSet EfficientNet-B1 + BirdCLEF projection head.
 
     Args:
-        num_classes: number of bird species.
-        backbone_name: timm model name (default: tf_efficientnet_b0_ns).
-        sample_rate: audio sample rate.
-        n_mels: mel bins for backbone spectrogram (128 for richer freq resolution).
-        nmf_n_mels: mel bins for NMF branch (64, must match dictionary).
-        W_path: path to NMF dictionary .npy file, shape (nmf_n_mels, K).
-        pretrained: load ImageNet weights for backbone.
+        num_classes: Number of BirdCLEF classes.
+        sample_rate: Audio sample rate.
+        birdset_model_name: HF model id for BirdSet EfficientNet.
+        pretrained: If False, initializes from config defaults (not recommended).
     """
 
-    def __init__(self, num_classes, backbone_name="tf_efficientnet_b0_ns",
-                 sample_rate=32000, n_fft=1024, hop_length=320,
-                 n_mels=128, f_min=50.0, f_max=14000.0,
-                 nmf_n_mels=64, W_path=None, pretrained=True):
+    def __init__(
+        self,
+        num_classes,
+        sample_rate=32000,
+        birdset_model_name="DBD-research-group/EfficientNet-B1-BirdSet-XCL",
+        max_time_frames=768,
+        chunk_hop_frames=512,
+        pretrained=True,
+    ):
         super().__init__()
+        if EfficientNetForImageClassification is None:
+            raise ImportError(
+                "transformers is required for BirdSet backbone. "
+                "Install with: pip install transformers safetensors"
+            ) from _TRANSFORMERS_IMPORT_ERROR
+
         self.num_classes = num_classes
         self.sample_rate = sample_rate
-        self.hop_length = hop_length
+        self.max_time_frames = int(max_time_frames)
+        self.chunk_hop_frames = int(chunk_hop_frames)
 
-        # --- Mel spectrogram for backbone ---
-        self.mel_extractor = build_mel_extractor(
-            sample_rate=sample_rate, n_fft=n_fft, hop_length=hop_length,
-            n_mels=n_mels, f_min=f_min, f_max=f_max,
+        # BirdSet-compatible frontend settings
+        self.n_fft = 2048
+        self.hop_length = 256
+        self.n_mels = 256
+        self.spec_norm_mean = -4.268
+        self.spec_norm_std = 4.569
+
+        self.spectrogram = T.Spectrogram(
+            n_fft=self.n_fft,
+            win_length=self.n_fft,
+            hop_length=self.hop_length,
+            power=2.0,
+            center=True,
+            pad_mode="reflect",
+        )
+        self.mel_scale = T.MelScale(
+            n_mels=self.n_mels,
+            sample_rate=self.sample_rate,
+            n_stft=(self.n_fft // 2) + 1,
+        )
+        self.amp_to_db = T.AmplitudeToDB(stype="power", top_db=80)
+
+        # Training-time spec augment (kept moderate)
+        self.freq_mask = T.FrequencyMasking(freq_mask_param=24)
+        self.time_mask = T.TimeMasking(time_mask_param=48)
+
+        self.register_buffer(
+            "_spec_mean",
+            torch.tensor(self.spec_norm_mean, dtype=torch.float32).view(1, 1, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_spec_std",
+            torch.tensor(self.spec_norm_std, dtype=torch.float32).view(1, 1, 1, 1),
+            persistent=False,
         )
 
-        # --- EfficientNet backbone ---
-        self.backbone = timm.create_model(
-            backbone_name, pretrained=pretrained, in_chans=1,
-            num_classes=0, global_pool="",  # no head, no pool
-        )
-        backbone_dim = self.backbone.num_features  # 1280 for efficientnet_b0
-
-        self.global_pool = nn.AdaptiveAvgPool2d(1)
-        self.head_drop = nn.Dropout(0.3)
-        self.head = nn.Linear(backbone_dim, num_classes)
-
-        # --- Spec augmentation (training only) ---
-        self.freq_mask = T.FrequencyMasking(freq_mask_param=16)
-        self.time_mask = T.TimeMasking(time_mask_param=64)
-
-        # --- Batch norm on mel ---
-        self.bn0 = nn.BatchNorm2d(n_mels)
-
-        # --- NMF branch ---
-        self.nmf_mel = build_nmf_mel_extractor(
-            sample_rate=sample_rate, n_fft=n_fft, hop_length=hop_length,
-            n_mels=nmf_n_mels, f_min=f_min, f_max=f_max,
-        )
-
-        if W_path is None:
-            W_path = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                "nmf_analysis", "output", "W_k56.npy",
+        if pretrained:
+            self.birdset_model = EfficientNetForImageClassification.from_pretrained(
+                birdset_model_name,
+                num_channels=1,
+                ignore_mismatched_sizes=True,
             )
-        if os.path.isfile(W_path):
-            _W = torch.from_numpy(np.load(W_path)).float()
-            self.register_buffer("W_nmf", _W)
-            self.nmf_k = _W.shape[1]
         else:
-            self.register_buffer("W_nmf", None)
-            self.nmf_k = 0
+            # Initialize from config only (no pretrained weights) —
+            # used when loading weights from a checkpoint instead.
+            from transformers import EfficientNetConfig
+            try:
+                config = EfficientNetConfig.from_pretrained(birdset_model_name)
+            except Exception:
+                config = EfficientNetConfig.from_pretrained(
+                    birdset_model_name, local_files_only=True,
+                )
+            config.num_channels = 1
+            self.birdset_model = EfficientNetForImageClassification(config)
 
-        nmf_feat_dim = 2 * self.nmf_k  # mean + max
-        if self.nmf_k > 0:
-            self.nmf_proj = nn.Linear(nmf_feat_dim, num_classes)
-        else:
-            self.nmf_proj = None
+        birdset_dim = int(self.birdset_model.config.num_labels)
+        self.latent_dim = birdset_dim
 
-        # latent dim for augmented embedding
-        self.latent_dim = backbone_dim + nmf_feat_dim
+        self.head_drop = nn.Dropout(0.2)
+        self.head = nn.Linear(birdset_dim, num_classes)
 
-    def _compute_mel(self, x):
-        """Waveform (B, T) -> log-mel (B, 1, n_mels, time_frames)."""
-        mel = self.mel_extractor(x)  # (B, n_mels, time)
-        mel = mel.unsqueeze(1)       # (B, 1, n_mels, time)
+    def _compute_birdset_mel(self, x):
+        """Waveform (B, T) -> normalized BirdSet mel image (B, 1, 256, time)."""
+        spec = self.spectrogram(x)          # (B, F, T)
+        mel = self.mel_scale(spec)          # (B, 256, T)
+        mel = self.amp_to_db(mel)           # (B, 256, T)
+        mel = mel.unsqueeze(1)              # (B, 1, 256, T)
+        mel = (mel - self._spec_mean) / (self._spec_std + 1e-8)
         return mel
 
     def _apply_spec_aug(self, mel):
@@ -151,83 +139,113 @@ class BirdCLEFModel(nn.Module):
         mel = self.time_mask(mel)
         return mel
 
-    @staticmethod
-    def _solve_nmf_h(V, W, num_iters=50, eps=1e-8):
-        """Solve V ~= W @ H for H using multiplicative updates."""
-        B, F, T_time = V.shape
-        K = W.shape[1]
-        device, dtype = V.device, V.dtype
-        W = W.to(device=device, dtype=dtype)
+    def preprocess_waveform(self, x, apply_spec_aug=False):
+        """Public preprocessing utility for teacher-student distillation."""
+        if x.dim() == 3 and x.shape[1] == 1:
+            x = x[:, 0, :]
+        mel = self._compute_birdset_mel(x)
+        if apply_spec_aug:
+            mel = self._apply_spec_aug(mel)
+        return mel
 
-        H = torch.ones((B, K, T_time), device=device, dtype=dtype)
-        WT = W.T                                         # (K, F)
-        WTW = WT @ W                                     # (K, K)
-        WTV = torch.matmul(WT.unsqueeze(0), V)           # (B, K, T)
+    def forward_birdset_logits(self, x, apply_spec_aug=False, return_mel=False):
+        """Return BirdSet logits before BirdCLEF projection.
 
-        for _ in range(num_iters):
-            denom = torch.matmul(WTW.unsqueeze(0), H) + eps
-            H = H * (WTV / denom)
-            H = torch.clamp(H, min=eps)
-        return H
+        Crops waveform to a bounded length BEFORE computing the STFT so that
+        GPU memory is always bounded regardless of input audio length.
 
-    @staticmethod
-    def _summarize_nmf_h(H):
-        """H (B, K, T) -> (B, 2K) via mean + max pooling."""
-        return torch.cat([H.mean(dim=2), H.amax(dim=2)], dim=1)
+        During training, a single random waveform chunk is used.
+        During eval, a sliding window over the waveform processes each chunk
+        through STFT+backbone individually and averages logits.
 
-    def _nmf_features(self, x):
-        """Waveform -> NMF summary features (B, 2K)."""
-        if self.W_nmf is None or self.nmf_k == 0:
-            return None
-        with torch.no_grad():
-            mel_pow = self.nmf_mel(x)                    # (B, 64, T)
-            mel_pow = torch.clamp(mel_pow, min=1e-10)
-            H = self._solve_nmf_h(mel_pow, self.W_nmf)
-            return self._summarize_nmf_h(H)
+        Args:
+            x: waveform (B, T) or (B, 1, T)
+            apply_spec_aug: apply SpecAugment to mel
+            return_mel: if True, also return the clean mel (for distillation)
+        Returns:
+            logits (B, birdset_dim)  or  (logits, mel_clean) if return_mel
+        """
+        if x.dim() == 3 and x.shape[1] == 1:
+            x = x[:, 0, :]
 
-    def forward(self, x, mixup_lambda=None):
+        # Max waveform samples that produce ~max_time_frames mel frames
+        max_wav_samples = self.max_time_frames * self.hop_length + self.n_fft
+
+        if self.training:
+            # ── Random crop waveform BEFORE STFT (bounded memory) ──
+            if x.shape[-1] > max_wav_samples:
+                max_start = x.shape[-1] - max_wav_samples
+                start = int(torch.randint(0, max_start + 1, (1,)).item())
+                x = x[..., start:start + max_wav_samples]
+
+            mel_clean = self._compute_birdset_mel(x)
+            mel = self._apply_spec_aug(mel_clean) if apply_spec_aug else mel_clean
+            logits = self.birdset_model(pixel_values=mel).logits
+            if return_mel:
+                return logits, mel_clean
+            return logits
+
+        # ── Eval: short audio fits in one pass ──
+        if x.shape[-1] <= max_wav_samples:
+            mel = self._compute_birdset_mel(x)
+            logits = self.birdset_model(pixel_values=mel).logits
+            if return_mel:
+                return logits, mel
+            return logits
+
+        # ── Eval: sliding window over waveform chunks ──
+        logits_sum = None
+        n_chunks = 0
+        wav_len = x.shape[-1]
+        wav_hop = self.chunk_hop_frames * self.hop_length
+
+        for start in range(0, wav_len, wav_hop):
+            end = min(start + max_wav_samples, wav_len)
+            x_chunk = x[..., start:end]
+            mel_chunk = self._compute_birdset_mel(x_chunk)
+            chunk_logits = self.birdset_model(pixel_values=mel_chunk).logits
+            if logits_sum is None:
+                logits_sum = chunk_logits
+            else:
+                logits_sum = logits_sum + chunk_logits
+            n_chunks += 1
+            if end >= wav_len:
+                break
+
+        result = logits_sum / max(n_chunks, 1)
+        if return_mel:
+            return result, None  # no single mel in multi-chunk eval
+        return result
+
+    def forward(self, x, mixup_lambda=None, apply_spec_aug=None, return_mel=False):
         """
         Args:
             x: waveform tensor, (B, T) or (B, 1, T).
+            return_mel: return clean mel in output dict (for distillation).
         Returns:
-            dict with 'clipwise_output' (B, num_classes) and 'latent_output'.
+            dict with 'clipwise_output', 'logits', 'latent_output',
+            'student_birdset_logits', and optionally 'mel_for_teacher'.
         """
-        if x.dim() == 3 and x.shape[1] == 1:
-            x = x[:, 0, :]  # (B, T)
+        if apply_spec_aug is None:
+            apply_spec_aug = self.training
 
-        # NMF branch (detached, no grad)
-        nmf_feat = self._nmf_features(x)
-
-        # Backbone branch
-        mel = self._compute_mel(x)  # (B, 1, n_mels, time)
-
-        # Batch norm over freq axis: BN2d expects (B, C, H, W) with C=n_mels
-        # mel is (B, 1, n_mels, time) -> squeeze channel, treat n_mels as C
-        mel = mel.squeeze(1)                    # (B, n_mels, time)
-        mel = mel.unsqueeze(-1)                 # (B, n_mels, time, 1)
-        mel = self.bn0(mel)
-        mel = mel.squeeze(-1).unsqueeze(1)      # (B, 1, n_mels, time)
-
-        if self.training:
-            mel = self._apply_spec_aug(mel)
-
-        # EfficientNet expects (B, C, H, W) — our (B, 1, n_mels, time) is fine
-        features = self.backbone(mel)          # (B, backbone_dim, H', W')
-        pooled = self.global_pool(features)    # (B, backbone_dim, 1, 1)
-        pooled = pooled.flatten(1)             # (B, backbone_dim)
-
-        logits = self.head(self.head_drop(pooled))  # (B, num_classes)
-
-        # Add NMF contribution
-        if nmf_feat is not None and self.nmf_proj is not None:
-            nmf_logits = self.nmf_proj(nmf_feat)
-            logits = logits + nmf_logits
-            latent = torch.cat([pooled, nmf_feat], dim=1)
+        fwd = self.forward_birdset_logits(
+            x, apply_spec_aug=apply_spec_aug, return_mel=return_mel,
+        )
+        if return_mel:
+            student_birdset_logits, mel_clean = fwd
         else:
-            latent = pooled
+            student_birdset_logits = fwd
+            mel_clean = None
 
-        output_dict = {
+        logits = self.head(self.head_drop(student_birdset_logits))
+
+        output = {
             "clipwise_output": torch.sigmoid(logits),
-            "latent_output": latent,
+            "logits": logits,
+            "latent_output": student_birdset_logits,
+            "student_birdset_logits": student_birdset_logits,
         }
-        return output_dict
+        if mel_clean is not None:
+            output["mel_for_teacher"] = mel_clean
+        return output
