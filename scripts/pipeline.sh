@@ -21,6 +21,9 @@
 #
 #   # Customize threshold/fold:
 #   CKPT=path/to/best.ckpt THRESHOLD=0.7 FOLD=2 sbatch scripts/pipeline.sh
+#
+#   # Reuse existing pseudo-labels (skip regeneration):
+#   CKPT=path/to/best.ckpt PSEUDO_CSV=data/pseudo_labels.csv sbatch scripts/pipeline.sh
 
 PROJECT_DIR="$HOME/BirdCallClassifier"
 ENV_NAME="birdcallclassifier"
@@ -43,15 +46,16 @@ FOLD="${FOLD:-0}"
 SEED="${SEED:-42}"
 THRESHOLD="${THRESHOLD:-0.8}"
 CKPT="${CKPT:-}"  # path to existing checkpoint; if empty, trains from scratch first
+PSEUDO_CSV="${PSEUDO_CSV:-}"  # path to existing pseudo-labels CSV; if empty, generates new ones
 JOB_ID="${SLURM_JOB_ID:-local_$(date +%Y%m%d_%H%M%S)}"
 
 PRETRAINED_PATH="$CKPT_DIR/HTSAT_AudioSet_Saved_1.ckpt"
 VALID_REGIONS="$PROJECT_DIR/data/valid_regions.json"
-PSEUDO_CSV="$PROJECT_DIR/data/pseudo_labels.csv"
 
 echo "=== Pipeline: pseudo-label → retrain ==="
 echo "Job: $JOB_ID, Fold: $FOLD, Seed: $SEED, Threshold: $THRESHOLD"
 echo "Checkpoint: ${CKPT:-'(will train from scratch first)'}"
+echo "Pseudo-labels: ${PSEUDO_CSV:-'(will generate new)'}"
 echo "---"
 
 # ── Preprocess: detect active vocal regions (cached) ──
@@ -85,7 +89,9 @@ if [ -z "$CKPT" ]; then
         --wandb_project birdclef-2026 \
         --run_name "htsat-${RUN_ID_R1}" \
         --run_id "$RUN_ID_R1" \
-        --valid_regions "$VALID_REGIONS"
+        --valid_regions "$VALID_REGIONS" \
+        --mix_prob 0.3 \
+        --balance_alpha 0.5
 
     # Find best checkpoint from round 1
     CKPT=$(ls -t "$CKPT_DIR/$RUN_ID_R1"/birdclef-htsat-*.ckpt 2>/dev/null | head -1)
@@ -99,19 +105,27 @@ else
     echo "=== Step 1: Using provided checkpoint: $CKPT ==="
 fi
 
-# ── Step 2: Pseudo-label ──
-echo ""
-echo "=== Step 2: Pseudo-labeling (threshold=$THRESHOLD) ==="
+# ── Step 2: Pseudo-label (skip if PSEUDO_CSV provided) ──
+if [ -n "$PSEUDO_CSV" ] && [ -f "$PSEUDO_CSV" ]; then
+    echo ""
+    echo "=== Step 2: Reusing existing pseudo-labels: $PSEUDO_CSV ==="
+else
+    # Generate unique filename so we don't overwrite previous runs
+    PSEUDO_CSV="$PROJECT_DIR/data/pseudo_labels_${JOB_ID}_t${THRESHOLD}.csv"
+    echo ""
+    echo "=== Step 2: Pseudo-labeling (threshold=$THRESHOLD) ==="
+    echo "Output: $PSEUDO_CSV"
 
-python scripts/pseudo_label.py \
-    --checkpoint "$CKPT" \
-    --data-dir "$PROJECT_DIR/data" \
-    --output "$PSEUDO_CSV" \
-    --threshold "$THRESHOLD" \
-    --batch-size 64 \
-    --use_wandb \
-    --wandb_project birdclef-2026 \
-    --run_name "pseudo-label-${JOB_ID}_fold${FOLD}"
+    python scripts/pseudo_label.py \
+        --checkpoint "$CKPT" \
+        --data-dir "$PROJECT_DIR/data" \
+        --output "$PSEUDO_CSV" \
+        --threshold "$THRESHOLD" \
+        --batch-size 64 \
+        --use_wandb \
+        --wandb_project birdclef-2026 \
+        --run_name "pseudo-label-${JOB_ID}_fold${FOLD}"
+fi
 
 N_PSEUDO=$(tail -n +2 "$PSEUDO_CSV" 2>/dev/null | wc -l)
 echo "Pseudo-labeled segments: $N_PSEUDO"
@@ -144,7 +158,9 @@ python src/train.py \
     --run_name "htsat-${RUN_ID_R2}" \
     --run_id "$RUN_ID_R2" \
     --valid_regions "$VALID_REGIONS" \
-    --pseudo_labels "$PSEUDO_CSV"
+    --pseudo_labels "$PSEUDO_CSV" \
+    --mix_prob 0.3 \
+    --balance_alpha 0.5
 
 echo ""
 echo "=== Pipeline complete ==="

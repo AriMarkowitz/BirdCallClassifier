@@ -367,7 +367,7 @@ def main():
                         help="Enable multi-species mixing augmentation on train_audio")
     parser.add_argument("--no_multi_mix", action="store_false", dest="multi_mix",
                         help="Disable multi-species mixing augmentation")
-    parser.add_argument("--mix_prob", type=float, default=0.7,
+    parser.add_argument("--mix_prob", type=float, default=0.3,
                         help="Probability of multi-species mixing per sample")
     parser.add_argument("--mixup_alpha", type=float, default=0.4,
                         help="Beta distribution alpha for SuMix (0=disabled)")

@@ -338,7 +338,7 @@ class SoundscapeDataset(Dataset):
 
 def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
                  seed=42, label_smoothing=0.0, n_folds=5, fold=0,
-                 multi_mix=True, mix_prob=0.7, preload=False,
+                 multi_mix=True, mix_prob=0.3, preload=False,
                  valid_regions_path=None, pseudo_labels_csv=None):
     """
     Build train/val datasets with k-fold CV.
@@ -446,7 +446,7 @@ def get_datasets(data_dir, sample_rate=32000, clip_duration=10.0, val_frac=0.25,
         audio_train_mixed = MultiSpeciesMixDataset(
             audio_train_sub, min_mix=1, max_mix=2, mix_prob=mix_prob,
         )
-        logger.info(f"Multi-species mixing enabled: prob={mix_prob}, 1-4 extra clips per sample")
+        logger.info(f"Multi-species mixing enabled: prob={mix_prob}, 1-2 extra clips per sample")
     else:
         audio_train_mixed = audio_train_sub
 
@@ -680,7 +680,7 @@ def _build_class_balanced_sampler(split_info, num_classes, n_train_audio, n_sc_t
 def get_dataloaders(data_dir, batch_size=32, num_workers=4, sample_rate=32000,
                     clip_duration=10.0, val_frac=0.25, seed=42,
                     label_smoothing=0.0,
-                    n_folds=5, fold=0, multi_mix=True, mix_prob=0.7,
+                    n_folds=5, fold=0, multi_mix=True, mix_prob=0.3,
                     preload=False, valid_regions_path=None,
                     pseudo_labels_csv=None, balance_alpha=0.5):
     """
