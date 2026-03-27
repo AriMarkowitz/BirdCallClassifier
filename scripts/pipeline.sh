@@ -76,7 +76,7 @@ if [ -z "$CKPT" ]; then
         --backbone "$BACKBONE" \
         --batch_size 64 \
         --num_workers 8 \
-        --max_epochs 25 \
+        --max_epochs 40 \
         --lr 1e-4 \
         --save_dir "$CKPT_DIR" \
         --seed "$SEED" \
@@ -137,7 +137,7 @@ python src/train.py \
     --backbone "$BACKBONE" \
     --batch_size 64 \
     --num_workers 8 \
-    --max_epochs 25 \
+    --max_epochs 40 \
     --lr 1e-4 \
     --save_dir "$CKPT_DIR" \
     --seed "$SEED" \

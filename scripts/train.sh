@@ -118,7 +118,7 @@ python src/train.py \
     --birdset_model_name "$BIRDSET_MODEL" \
     --batch_size "$BATCH_SIZE" \
     --num_workers 8 \
-    --max_epochs 25 \
+    --max_epochs 40 \
     --lr 5e-5 \
     --precision "$PRECISION" \
     --max_time_frames "$MAX_TIME_FRAMES" \

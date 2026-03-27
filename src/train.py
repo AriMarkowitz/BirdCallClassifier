@@ -56,7 +56,7 @@ class BirdCLEFWrapper(pl.LightningModule):
         model,
         num_classes,
         learning_rate=1e-4,
-        max_epochs=30,
+        max_epochs=40,
         loss_type="bce",
         focal_alpha=0.25,
         focal_gamma=2.0,
