@@ -6,7 +6,7 @@
 - [x] Secondary labels in train_audio (multi-hot targets)
 - [x] Label smoothing (ε=0.1)
 - [x] All taxonomy classes trained (birds, insects, amphibians, mammals, reptiles)
-- [x] NMF latent feature integration into HTSAT forward pass (global dictionary W_k56, nmf_proj head)
+- [x] NMF latent feature integration (global dictionary W_k56, nmf_proj head) — superseded by BirdSet EfficientNet-B1 backbone
 ## Key problem: domain shift
 Val AUC was 0.999 but Kaggle score is 0.848. The inflated val AUC was because validation only used soundscape segments (most species absent → trivially high AUC). **Fixed:** validation now includes a stratified holdout of train_audio + soundscape fold, so val AUC reflects all species. The model memorizes clean focal recordings but cannot generalize to noisy, polyphonic test soundscapes. Past BirdCLEF winners confirm this is THE problem to solve. Everything below is ordered by expected impact on closing this gap.
 
@@ -20,7 +20,7 @@ The model trains on clean single-species focal recordings but tests on noisy mul
 - [x] **Multi-species mixing** — implemented as `MultiSpeciesMixDataset` in dataset.py. Overlays 1-4 random train_audio clips at gains 0.1-0.7 with probability 0.3 per sample. Union of multi-hot labels. Enabled by default (`--multi_mix`, `--mix_prob 0.3`).
 - [x] **MixUp / SuMix** — implemented as batch-level SuMix in train.py `_sumix()`. Shuffles batch and additively mixes waveforms with Beta-distributed lambda, soft-union labels. Enabled by default (`--mixup_alpha 0.4`).
 - [ ] **Soundscape background injection** — mix a random crop from the 10,593 unlabeled soundscape files as background noise behind clean train_audio clips. This is the most realistic noise source possible — same equipment, same sites, same ambient conditions as test data. ~5GB of free noise available in `data/train_soundscapes/`.
-- [x] **SpecAugment** — HTSAT already applies SpecAugmentation (time_drop_width=64, time_stripes_num=2, freq_drop_width=8, freq_stripes_num=2) during training. Built into the backbone.
+- [x] **SpecAugment** — applied via `FrequencyMasking` and `TimeMasking` in BirdSet EfficientNet-B1 frontend during training.
 - [ ] **FilterAugment** — apply random band-wise spectral shaping / filtering to mimic microphone, habitat, and distance variation. Useful for domain robustness without changing labels.
 - [ ] **Time shift** — randomly roll or offset clips within the 5s window so detections are less position-dependent. Cheap augmentation and also useful to mirror test-time offset variability.
 - [ ] **Pitch shift (light)** — small semitone perturbations only (e.g. ±0.5 to ±1.0 semitones) to improve robustness while avoiding unrealistic bird vocal transformations.
@@ -38,7 +38,7 @@ Only 66 of 10,658 soundscape files have labels (1,478 segments). The other 10,59
 
 ### 3. Focal loss
 - [x] **Replace BCELoss with focal loss** — implemented as `--loss focal` flag in train.py. Down-weights easy negatives (230+ absent species per segment), focuses gradients on hard positives. Default α=0.25, γ=2.0.
-- [ ] **Focal loss ablation** — compare BCE vs focal loss under the current HTSAT+NMF setup, especially once stronger augmentation is enabled. Check whether focal improves rare/quiet species recall without destabilizing calibration.
+- [ ] **Focal loss ablation** — compare BCE vs focal loss under the current BirdSet EfficientNet setup, especially once stronger augmentation is enabled. Check whether focal improves rare/quiet species recall without destabilizing calibration.
 
 ### 4. Regional hard-negative training with supplemental Pantanal species (PRIORITY)
 The Pantanal hosts ~650 bird species alone, but we only train on 234 classes. The other 400+ species are present in test soundscapes as unlabeled vocalizations. Without hearing them during training, the model either ignores them (lucky) or misclassifies them as one of our 234 targets (false positives). This is likely a major source of score loss.
@@ -87,14 +87,20 @@ These have enough data but still underperform — likely acoustic confusion with
 - [ ] **Rare-label validation slice** — maintain a reporting view focused on low-resource classes so leaderboard improvements are not driven only by already-common species.
 
 ### 5. Bird-MAE-Base backbone (deprioritized)
-- [x] **Replace HTSAT with Bird-MAE-Base** — NO NOTABLE BENEFIT - self-supervised ViT-B/16 (85M params, 768-dim embeddings) pretrained via masked autoencoder on BirdSet's 9.7k species ([model](https://huggingface.co/DBD-research-group/Bird-MAE-Base)). Potentially better representations but ~2.5x larger than HTSAT-tiny. Previously prototyped on `bird-mae-backbone` branch but deprioritized in favor of HTSAT+NMF approach. Would need to verify it fits in Kaggle's 90-min CPU inference window.
+- [x] **Replace HTSAT with Bird-MAE-Base** — NO NOTABLE BENEFIT - self-supervised ViT-B/16 (85M params, 768-dim embeddings) pretrained via masked autoencoder on BirdSet's 9.7k species ([model](https://huggingface.co/DBD-research-group/Bird-MAE-Base)). Previously prototyped on `bird-mae-backbone` branch but deprioritized in favor of BirdSet EfficientNet-B1.
 
 ---
 
 ## Tier 2 — High potential, more effort
 
-### 6. Longer-context SED-style training
-- [ ] **Train on longer windows** — instead of 10s clips, train on 30-60s windows with frame-level (SED) predictions. Past winners found that longer context helps the model learn temporal patterns of species calls within a soundscape. Requires adjusting the HTSAT input size or using a sliding window with aggregation.
+### 6. Event detection clip filtering (DEFERRED)
+Core problem: a random 5s crop from a 30s training file may not contain the labeled species at all, creating label noise. The current energy-based VAD (`preprocess_activity.py`) is not species-aware and can't reliably solve this. Options ranked by trustworthiness:
+- [ ] **Use trained model to filter crops** — run the best checkpoint over all train_audio files in 5s windows, keep only windows where model confidence > threshold for the labeled species. Species-specific, no external dependency. Mild confirmation bias risk but strictly better than energy VAD.
+- [ ] **Framewise max pooling (full-file training)** — train on full 30s recordings with per-frame class scores, aggregate via `max` over time. Supervision pushes the model to find real call frames; silence frames get low scores naturally. Most principled solution, no filtering needed.
+- [ ] **BirdNET pre-filtering** — run BirdNET over train_audio, keep windows with high BirdNET confidence for the labeled species. Fast, species-aware, but BirdNET only covers ~6000 species and may miss rare/regional classes — fall back to random crop for unrecognized species.
+
+### 7. Longer-context SED-style training
+- [ ] **Train on longer windows** — instead of 5s clips, train on 30s windows with frame-level (SED) predictions and temporal max pooling. Past winners found that longer context helps the model learn temporal patterns of species calls within a soundscape.
 
 ### 7. Transfer learning from larger bird-audio sources
 - [ ] **BirdSet XCM pretraining (stage 0)** — 89k focal recordings, 409 species, 89GB. Fine-tune backbone on XCM first, then on BirdCLEF data. Stays within current architecture. Need to check species overlap with our 234 classes.
@@ -124,16 +130,12 @@ train.csv has a `rating` column (0-5 scale from Xeno-canto/iNaturalist): 6,845 f
 - [ ] **Hybrid sampling scheme** — keep some natural-frequency batches for calibration while reserving part of each epoch for rare-label upsampling. Goal: reduce imbalance without making the train distribution too unrealistic.
 - [ ] **Taxon-aware sampling** — ensure insects / amphibians / mammals / reptiles are not drowned out by abundant bird labels when constructing batches.
 
-### 9. NMF latent basis — next steps
-Steps 1-2 are done: global dictionary W (k=56) learned via NMFk, and per-clip projection integrated directly into HTSAT forward pass (multiplicative updates solver + nmf_proj linear head). Remaining work:
+### 9. NMF latent basis — deprioritized
+Steps 1-2 were done under the old HTSAT backbone. With BirdSet EfficientNet-B1, the NMF branch is no longer integrated. Keeping for reference only.
 
 - [x] **Step 1: Learn global dictionary W** — done. W_k56.npy in `nmf_analysis/output/`, learned from representative soundscape spectrograms via NMFk.
-- [x] **Step 2: Project clips into fixed basis** — done. Integrated into HTSAT forward pass: power mel spectrogram → solve H via multiplicative updates (W fixed) → mean+max summary → nmf_proj linear layer → added to classification logits.
-- [ ] **Step 3: Train small CNN encoder to approximate latent features** — train a small CNN (not MLP — input has time-frequency structure) to predict the NMF latent summary vector from Step 2 directly from the clip spectrogram. Target is the NMF latent vector, not the class label. This replaces the per-clip multiplicative updates solve with a fast learned forward pass at inference time.
-- [ ] **Step 4: Fuse latent branch with main classifier** — two options to evaluate:
-  - **Option A: Feature concatenation** — concatenate (a) learned deep features from HTSAT backbone and (b) CNN-predicted NMF latent features before the classification head. NMF branch stays fully independent — easy to train, debug, and ablate separately. Adds minor inference cost (MobileNetV3-Small side branch).
-  - **Option B: Auxiliary loss (no inference cost)** — add a second head to HTSAT that predicts the NMF latent vector as a regularization signal during training, then discard that head at inference. Pushes HTSAT's internal representations to capture spectral structure NMF finds, without adding any inference cost. More exotic — try Option A first.
-- [ ] **Step 5: Ablation ladder** — test in order: (1) baseline, (2) baseline + exact NMF features (current), (3) baseline + CNN-predicted latent features, (4) optionally both. Judge by val performance and robustness on noisy soundscapes. Stop early if no improvement.
+- [x] **Step 2: Project clips into fixed basis** — done under HTSAT. Not ported to BirdSet EfficientNet-B1.
+- [ ] **Steps 3-5** — deprioritized. BirdSet EfficientNet-B1 + temporal attention pooling achieves better val AUC without NMF.
 
 ### 10. Post-processing
 - [ ] **Threshold tuning** — optimize per-class thresholds on validation set instead of using 0.5 cutoff. Quick win, no retraining.

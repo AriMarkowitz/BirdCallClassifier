@@ -38,9 +38,6 @@ Or open Weights & Biases — run `wandb login` on the login node before submitti
 ### Curriculum training
 Soundscape weight ramps linearly from 0.5 (mostly clean audio) to 3.0 (heavy soundscape focus) over the training run. Progress is logged each epoch.
 
-### NMF feature integration
-The HTSAT model includes an NMF latent feature branch. A fixed global dictionary (`nmf_analysis/output/W_k56.npy`, 64 mel bins × 56 components) is loaded at model init. During forward pass, the model computes a power mel spectrogram, solves for NMF activations H via multiplicative updates (50 iterations, no gradient), summarizes H via mean+max pooling → 112-dim feature vector, and projects this through `nmf_proj` (a linear layer) to produce class logits that are added to the HTSAT classification output. The NMF dictionary is frozen; only `nmf_proj` is trained.
-
 ---
 
 ## B) Inference (local test)
@@ -57,9 +54,9 @@ This expects Kaggle-style paths (`/kaggle/input/...`). For local testing you'd n
 
 ### What lives in `kaggle_dataset/`
 This directory is the Kaggle dataset that gets uploaded. It contains:
-- `htsat/` — vendored HTSAT model code
-- `taxonomy.csv` — class label map
-- `birdclef-htsat-*.ckpt` — trained checkpoint(s)
+- `src/model.py` — model architecture (auto-synced by `submit.sh`)
+- `DBD-research-group/EfficientNet-B1-BirdSet-XCL/` — BirdSet config (no internet at inference)
+- `birdclef-birdset-*.ckpt` — trained checkpoint(s)
 - `dataset-metadata.json` — dataset ID (`arimarkowitz/birdclef-2026-model`)
 
 ### One-command submit (recommended)
@@ -76,11 +73,11 @@ This handles the full pipeline: clears old checkpoints, copies best from each ru
 
 #### Step 1 — Copy new checkpoint(s) in
 ```bash
-rm kaggle_dataset/birdclef-htsat-*.ckpt  # clear old ones
+rm kaggle_dataset/birdclef-birdset-*.ckpt  # clear old ones
 
 # Copy best from each run (replace <run_id> with e.g. 309600_seed42)
 for run_id in <run1> <run2> <run3>; do
-    best=$(ls checkpoints/${run_id}/birdclef-htsat-*.ckpt | sed 's/.*val_macro_auc[=_]\([0-9.]*\).*/\1 &/' | sort -rn | head -1 | cut -d' ' -f2)
+    best=$(ls checkpoints/${run_id}/birdclef-birdset-*.ckpt | sed 's/.*val_macro_auc[=_]\([0-9.]*\).*/\1 &/' | sort -rn | head -1 | cut -d' ' -f2)
     cp "$best" kaggle_dataset/
 done
 ```

@@ -1,10 +1,10 @@
 #!/bin/bash
-# Launch full pipeline (stage 1 + stage 2) for all 5 folds.
+# Launch BirdSet EfficientNet training for all folds.
 # Each fold runs as a single SLURM job.
 #
 # Usage:
 #   bash scripts/train_full_pipeline_ensemble.sh
-#   S1_EPOCHS=25 S2_EPOCHS=15 bash scripts/train_full_pipeline_ensemble.sh
+#   MAX_EPOCHS=50 bash scripts/train_full_pipeline_ensemble.sh
 
 N_FOLDS="${N_FOLDS:-4}"
 

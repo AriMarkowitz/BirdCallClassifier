@@ -10,8 +10,8 @@
 #SBATCH --output=logs/birdclef_%j.log
 #SBATCH --error=logs/birdclef_%j.log
 
-# Full pipeline: Stage 1 (HTSAT + zeroed temporal MLP) → Stage 2 (temporal MLP only)
-# Runs both stages in a single SLURM job per fold.
+# Full pipeline: BirdSet EfficientNet training + optional pseudo-labeling retrain
+# Runs in a single SLURM job per fold.
 #
 # Usage:
 #   sbatch scripts/train_full_pipeline.sh                    # fold 0
@@ -59,99 +59,69 @@ echo "---"
 
 cd "$PROJECT_DIR"
 
-# ── Download pretrained checkpoint if not present ──
-CKPT_PATH="$CKPT_DIR/HTSAT_AudioSet_Saved_1.ckpt"
-mkdir -p "$CKPT_DIR"
+# Reduce allocator fragmentation on long variable-length batches
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
-if [ ! -f "$CKPT_PATH" ]; then
-    echo "Downloading AudioSet pretrained HTSAT checkpoint..."
-    pip install -q gdown
-    gdown "https://drive.google.com/uc?id=1OK8a5XuMVLyeVKF117L8pfxeZYdfSDZv" \
-        -O "$CKPT_PATH" || echo "WARNING: Checkpoint download failed. Will train from scratch."
+# ── Preprocess: detect active vocal regions (one-time, cached) ──
+VALID_REGIONS="$PROJECT_DIR/data/valid_regions.json"
+if [ ! -f "$VALID_REGIONS" ]; then
+    echo "Detecting active vocal regions in train_audio (one-time preprocessing)..."
+    python scripts/preprocess_activity.py \
+        --data-dir "$PROJECT_DIR/data" \
+        --output "$VALID_REGIONS"
 fi
 
 # ── Config ──
 FOLD="${FOLD:-0}"
 SEED="${SEED:-42}"
-S1_EPOCHS="${S1_EPOCHS:-30}"
-S2_EPOCHS="${S2_EPOCHS:-20}"
+MAX_EPOCHS="${MAX_EPOCHS:-40}"
+BIRDSET_MODEL="${BIRDSET_MODEL:-DBD-research-group/EfficientNet-B1-BirdSet-XCL}"
 
 JOB_ID="${SLURM_JOB_ID:-local_$(date +%Y%m%d_%H%M%S)}"
-S1_RUN_ID="${JOB_ID}_s1_fold${FOLD}"
-S2_RUN_ID="${JOB_ID}_s2_fold${FOLD}"
+RUN_ID="${JOB_ID}_fold${FOLD}"
 
 echo "========================================="
-echo "  Full pipeline: fold=$FOLD"
-echo "  Stage 1: ${S1_EPOCHS} epochs (full model)"
-echo "  Stage 2: ${S2_EPOCHS} epochs (temporal MLP)"
+echo "  BirdSet EfficientNet training: fold=$FOLD"
+echo "  Epochs: ${MAX_EPOCHS}"
+echo "  Backbone: ${BIRDSET_MODEL}"
 echo "========================================="
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Stage 1: Full model with zeroed temporal inputs
+# Train BirdSet EfficientNet
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
-echo "=== STAGE 1: Full model training ==="
+echo "=== Training BirdSet EfficientNet ==="
 
 python src/train.py \
     --data_dir "$PROJECT_DIR/data" \
-    --checkpoint "$CKPT_PATH" \
-    --batch_size 128 \
+    --birdset_model_name "$BIRDSET_MODEL" \
+    --batch_size 16 \
     --num_workers 8 \
-    --max_epochs "$S1_EPOCHS" \
-    --lr 1e-4 \
+    --max_epochs "$MAX_EPOCHS" \
+    --lr 5e-5 \
+    --precision bf16 \
     --save_dir "$CKPT_DIR" \
     --seed "$SEED" \
-    --label_smoothing 0.1 \
+    --loss focal \
+    --label_smoothing 0.05 \
     --n_folds 5 \
     --fold "$FOLD" \
-    --stage 1 \
+    --min_duration 5.0 \
+    --max_duration 5.0 \
+    --no_full_files \
+    --distill \
+    --distill_weight 0.15 \
+    --distill_temperature 2.0 \
+    --balance_alpha 0.5 \
     --use_wandb \
     --wandb_project birdclef-2026 \
-    --run_name "htsat-${S1_RUN_ID}" \
-    --run_id "$S1_RUN_ID"
-
-echo "Stage 1 complete."
-
-# ── Find best stage 1 checkpoint ──
-S1_DIR="$CKPT_DIR/$S1_RUN_ID"
-BEST_S1=$(ls "$S1_DIR"/birdclef-htsat-*.ckpt 2>/dev/null \
-    | sed 's/.*val_macro_auc[=_]\([0-9.]*\).*/\1 &/' \
-    | sort -rn | head -1 | cut -d' ' -f2)
-
-if [ -z "$BEST_S1" ]; then
-    echo "ERROR: No stage 1 checkpoints found in $S1_DIR"
-    exit 1
-fi
-echo "Best stage 1 checkpoint: $BEST_S1"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Stage 2: Train temporal MLP on soundscapes only
-# ══════════════════════════════════════════════════════════════════════════════
-echo ""
-echo "=== STAGE 2: Temporal MLP training ==="
-
-python src/train.py \
-    --data_dir "$PROJECT_DIR/data" \
-    --batch_size 128 \
-    --num_workers 8 \
-    --max_epochs "$S2_EPOCHS" \
-    --lr 1e-3 \
-    --save_dir "$CKPT_DIR" \
-    --seed "$SEED" \
-    --label_smoothing 0.1 \
-    --n_folds 5 \
-    --fold "$FOLD" \
-    --stage 2 \
-    --stage1_ckpt "$BEST_S1" \
-    --use_wandb \
-    --wandb_project birdclef-2026 \
-    --run_name "htsat-${S2_RUN_ID}" \
-    --run_id "$S2_RUN_ID"
+    --run_name "enet-${RUN_ID}" \
+    --run_id "$RUN_ID" \
+    --valid_regions "$VALID_REGIONS"
 
 echo ""
 echo "========================================="
-echo "  Full pipeline complete!"
-echo "  Stage 1: $S1_RUN_ID"
-echo "  Stage 2: $S2_RUN_ID"
+echo "  Training complete!"
+echo "  Run ID: $RUN_ID"
 echo "  Fold: $FOLD"
 echo "========================================="

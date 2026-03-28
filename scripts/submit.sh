@@ -26,8 +26,13 @@ else
     echo "Mode: best val_macro_auc checkpoint per run"
 fi
 
+# Always sync model code so inference uses the current architecture
+mkdir -p "$KAGGLE_DS/src"
+cp "$PROJECT_DIR/src/model.py" "$KAGGLE_DS/src/model.py"
+echo "Synced src/model.py to kaggle_dataset/"
+
 # Clear old checkpoints
-rm -f "$KAGGLE_DS"/birdclef-htsat-*.ckpt
+rm -f "$KAGGLE_DS"/birdclef-birdset-*.ckpt "$KAGGLE_DS"/birdclef-htsat-*.ckpt
 echo "Cleared old checkpoints from kaggle_dataset/"
 
 if [ $# -gt 0 ]; then
@@ -42,10 +47,10 @@ if [ $# -gt 0 ]; then
 
         if [ "$USE_LATEST" = "1" ]; then
             # Pick most recently modified checkpoint
-            picked=$(ls -t "$run_dir"/birdclef-htsat-*.ckpt 2>/dev/null | head -1)
+            picked=$(ls -t "$run_dir"/birdclef-birdset-*.ckpt 2>/dev/null | head -1)
         else
             # Pick checkpoint with highest val_macro_auc from filename
-            picked=$(ls "$run_dir"/birdclef-htsat-*.ckpt 2>/dev/null | sed 's/.*val_macro_auc[=_]\([0-9.]*\).*/\1 &/' | sort -rn | head -1 | cut -d' ' -f2)
+            picked=$(ls "$run_dir"/birdclef-birdset-*.ckpt 2>/dev/null | sed 's/.*val_macro_auc[=_]\([0-9.]*\).*/\1 &/' | sort -rn | head -1 | cut -d' ' -f2)
         fi
 
         if [ -z "$picked" ]; then
@@ -63,7 +68,7 @@ if [ $# -gt 0 ]; then
 else
     echo "No run IDs specified — using existing checkpoints in kaggle_dataset/"
     # Check there's at least one
-    if ! ls "$KAGGLE_DS"/birdclef-htsat-*.ckpt &>/dev/null; then
+    if ! ls "$KAGGLE_DS"/birdclef-birdset-*.ckpt &>/dev/null; then
         echo "ERROR: No checkpoints found in $KAGGLE_DS/"
         echo "Usage: bash scripts/submit.sh <run_id1> [run_id2] ..."
         echo "Available runs:"
@@ -74,12 +79,12 @@ fi
 
 echo ""
 echo "Checkpoints to upload:"
-ls -lh "$KAGGLE_DS"/birdclef-htsat-*.ckpt
+ls -lh "$KAGGLE_DS"/birdclef-birdset-*.ckpt
 echo ""
 
 # ── Step 2: Upload dataset ────────────────────────────────────────────────────
 echo "=== Step 2: Uploading dataset to Kaggle ==="
-CKPT_COUNT=$(ls "$KAGGLE_DS"/birdclef-htsat-*.ckpt | wc -l)
+CKPT_COUNT=$(ls "$KAGGLE_DS"/birdclef-birdset-*.ckpt | wc -l)
 kaggle datasets version -p "$KAGGLE_DS" -m "Ensemble: ${CKPT_COUNT} checkpoints" --dir-mode zip
 echo ""
 

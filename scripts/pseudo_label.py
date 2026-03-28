@@ -43,11 +43,10 @@ SEGMENT_DURATION = 5.0  # seconds — matches soundscape label format
 SEGMENT_SAMPLES = int(SAMPLE_RATE * SEGMENT_DURATION)
 
 
-def load_model(checkpoint_path, num_classes, device, backbone="tf_efficientnet_b0_ns"):
+def load_model(checkpoint_path, num_classes, device):
     """Load a trained BirdCLEFWrapper from a Lightning checkpoint."""
     model = BirdCLEFModel(
         num_classes=num_classes,
-        backbone_name=backbone,
         sample_rate=SAMPLE_RATE,
         pretrained=False,  # weights come from checkpoint
     )
@@ -145,7 +144,6 @@ def main():
     parser.add_argument("--threshold", type=float, default=0.8)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--device", type=str, default="auto")
-    parser.add_argument("--backbone", type=str, default="tf_efficientnet_b0_ns")
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="birdclef-2026")
     parser.add_argument("--run_name", type=str, default=None)
@@ -164,7 +162,7 @@ def main():
     idx_to_label = {v: k for k, v in label_map.items()}
     logger.info(f"Classes: {num_classes}")
 
-    model = load_model(args.checkpoint, num_classes, device, backbone=args.backbone)
+    model = load_model(args.checkpoint, num_classes, device)
 
     # --- Collect files to pseudo-label ---
     soundscape_dir = data_dir / "train_soundscapes"

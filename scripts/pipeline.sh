@@ -14,7 +14,7 @@
 #
 # Usage:
 #   # Pseudo-label from existing checkpoint, then retrain:
-#   CKPT=checkpoints/xxx/birdclef-enet-epoch=21-val_macro_auc=0.9557.ckpt sbatch scripts/pipeline.sh
+#   CKPT=checkpoints/xxx/birdclef-birdset-epoch=38-val_macro_auc=0.8877.ckpt sbatch scripts/pipeline.sh
 #
 #   # Full pipeline (train from scratch → pseudo-label → retrain):
 #   sbatch scripts/pipeline.sh
@@ -44,16 +44,14 @@ SEED="${SEED:-42}"
 THRESHOLD="${THRESHOLD:-0.8}"
 CKPT="${CKPT:-}"  # path to existing checkpoint; if empty, trains from scratch first
 JOB_ID="${SLURM_JOB_ID:-local_$(date +%Y%m%d_%H%M%S)}"
-BACKBONE="${BACKBONE:-tf_efficientnet_b0_ns}"
-MIN_DURATION="${MIN_DURATION:-3.0}"
-MAX_DURATION="${MAX_DURATION:-30.0}"
+MIN_DURATION="${MIN_DURATION:-5.0}"
+MAX_DURATION="${MAX_DURATION:-5.0}"
 
 VALID_REGIONS="$PROJECT_DIR/data/valid_regions.json"
 PSEUDO_CSV="$PROJECT_DIR/data/pseudo_labels.csv"
 
 echo "=== Pipeline: pseudo-label → retrain ==="
 echo "Job: $JOB_ID, Fold: $FOLD, Seed: $SEED, Threshold: $THRESHOLD"
-echo "Backbone: $BACKBONE"
 echo "Checkpoint: ${CKPT:-'(will train from scratch first)'}"
 echo "---"
 
@@ -73,19 +71,22 @@ if [ -z "$CKPT" ]; then
 
     python src/train.py \
         --data_dir "$PROJECT_DIR/data" \
-        --backbone "$BACKBONE" \
-        --batch_size 64 \
+        --batch_size 16 \
         --num_workers 8 \
         --max_epochs 40 \
-        --lr 1e-4 \
+        --lr 5e-5 \
+        --precision bf16 \
         --save_dir "$CKPT_DIR" \
         --seed "$SEED" \
         --loss focal \
-        --label_smoothing 0.1 \
+        --label_smoothing 0.05 \
         --n_folds 5 \
         --fold "$FOLD" \
         --min_duration "$MIN_DURATION" \
         --max_duration "$MAX_DURATION" \
+        --full_files \
+        --distill \
+        --balance_alpha 0.5 \
         --use_wandb \
         --wandb_project birdclef-2026 \
         --run_name "enet-${RUN_ID_R1}" \
@@ -93,7 +94,7 @@ if [ -z "$CKPT" ]; then
         --valid_regions "$VALID_REGIONS"
 
     # Find best checkpoint from round 1
-    CKPT=$(ls -t "$CKPT_DIR/$RUN_ID_R1"/birdclef-enet-*.ckpt 2>/dev/null | head -1)
+    CKPT=$(ls -t "$CKPT_DIR/$RUN_ID_R1"/birdclef-birdset-*.ckpt 2>/dev/null | head -1)
     if [ -z "$CKPT" ]; then
         echo "ERROR: No checkpoint found in $CKPT_DIR/$RUN_ID_R1/"
         exit 1
@@ -114,7 +115,6 @@ python scripts/pseudo_label.py \
     --output "$PSEUDO_CSV" \
     --threshold "$THRESHOLD" \
     --batch-size 64 \
-    --backbone "$BACKBONE" \
     --use_wandb \
     --wandb_project birdclef-2026 \
     --run_name "pseudo-label-${JOB_ID}_fold${FOLD}"
@@ -134,19 +134,22 @@ echo "=== Step 3: Retraining with pseudo-labels (run=$RUN_ID_R2) ==="
 
 python src/train.py \
     --data_dir "$PROJECT_DIR/data" \
-    --backbone "$BACKBONE" \
-    --batch_size 64 \
+    --batch_size 16 \
     --num_workers 8 \
     --max_epochs 40 \
-    --lr 1e-4 \
+    --lr 5e-5 \
+    --precision bf16 \
     --save_dir "$CKPT_DIR" \
     --seed "$SEED" \
     --loss focal \
-    --label_smoothing 0.1 \
+    --label_smoothing 0.05 \
     --n_folds 5 \
     --fold "$FOLD" \
     --min_duration "$MIN_DURATION" \
     --max_duration "$MAX_DURATION" \
+    --full_files \
+    --distill \
+    --balance_alpha 0.5 \
     --use_wandb \
     --wandb_project birdclef-2026 \
     --run_name "enet-${RUN_ID_R2}" \
