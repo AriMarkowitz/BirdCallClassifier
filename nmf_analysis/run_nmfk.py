@@ -197,26 +197,39 @@ def select_k(results: list[dict]) -> dict:
     Strategy:
     1. Find k values where silhouette is above threshold (stable solutions).
     2. Among those, find where AIC is minimized (best complexity tradeoff).
-    3. If AIC keeps decreasing, pick the k with highest silhouette.
+    3. If AIC keeps decreasing at the boundary, fall back to highest silhouette.
+    4. If AIC minimum is at the first k tested, warn that k_min may be too high.
     """
     # Filter for reasonable silhouette (> 0.5 = "reasonable structure")
     stable = [r for r in results if r["silhouette"] > 0.5]
     if not stable:
-        # Fall back to all results
         stable = results
         log.warning("No k values with silhouette > 0.5, using all results")
 
-    # Check if AIC has a clear minimum
+    # Check if AIC has a clear interior minimum
     aic_values = [r["aic"] for r in stable]
     min_aic_idx = np.argmin(aic_values)
 
-    # If AIC minimum is at the boundary (last k), it's still decreasing
     if min_aic_idx == len(stable) - 1:
-        log.warning("AIC still decreasing at max k tested — consider extending range")
-        # Fall back to highest silhouette among stable results
+        log.warning(
+            f"AIC still decreasing at max k={stable[-1]['k']} tested "
+            f"(AIC={stable[-1]['aic']:.1f}). The k range likely needs to be "
+            f"extended upward to find the AIC elbow. "
+            f"Falling back to highest silhouette."
+        )
         best = max(stable, key=lambda r: r["silhouette"])
+        best["selection_method"] = "silhouette_fallback_aic_boundary"
+    elif min_aic_idx == 0:
+        log.warning(
+            f"AIC minimum at first k={stable[0]['k']} tested. "
+            f"Consider lowering k_min to confirm this is a true minimum."
+        )
+        best = stable[min_aic_idx]
+        best["selection_method"] = "aic_minimum_at_lower_boundary"
     else:
         best = stable[min_aic_idx]
+        best["selection_method"] = "aic_interior_minimum"
+        log.info(f"AIC found interior minimum at k={best['k']}")
 
     return best
 
@@ -224,9 +237,12 @@ def select_k(results: list[dict]) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="Run NMFk rank selection (GPU, HALS)")
     parser.add_argument("--input-dir", type=str, default="nmf_analysis/output")
-    parser.add_argument("--k-min", type=int, default=10)
-    parser.add_argument("--k-max", type=int, default=100)
-    parser.add_argument("--k-step", type=int, default=10)
+    parser.add_argument("--k-min", type=int, default=10,
+                        help="Minimum rank to test (should be well below expected optimum)")
+    parser.add_argument("--k-max", type=int, default=100,
+                        help="Maximum rank to test (should be well above expected optimum "
+                             "so AIC can find its elbow)")
+    parser.add_argument("--k-step", type=int, default=5)
     parser.add_argument("--n-runs", type=int, default=10,
                         help="Number of NMF runs per k for stability estimation")
     parser.add_argument("--max-iter", type=int, default=500)
@@ -320,6 +336,7 @@ def main():
             "silhouette": best_result["silhouette"],
             "aic": best_result["aic"],
             "error": best_result["mean_relative_error"],
+            "method": best_result.get("selection_method", "unknown"),
         },
         "n_runs_per_k": args.n_runs,
         "algo": args.algo,

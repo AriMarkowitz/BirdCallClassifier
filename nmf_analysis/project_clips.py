@@ -38,11 +38,14 @@ log = logging.getLogger(__name__)
 
 
 def gpu_nnls(W: torch.Tensor, V_clip: torch.Tensor,
-             max_iter: int = 200, tol: float = 1e-6) -> torch.Tensor:
+             max_iter: int = 200, tol: float = 1e-6,
+             check_every: int = 20) -> torch.Tensor:
     """Solve V_clip ≈ W @ H for H >= 0 via multiplicative updates on GPU.
 
     W: (f, k), V_clip: (f, T) -> H: (k, T)
     Much faster than scipy.nnls column-by-column on CPU.
+    Checks convergence every `check_every` iterations and stops early
+    when the relative change in H drops below `tol`.
     """
     eps = 1e-10
     k = W.shape[1]
@@ -55,21 +58,31 @@ def gpu_nnls(W: torch.Tensor, V_clip: torch.Tensor,
     WtW = W.T @ W  # (k, k)
     WtV = W.T @ V_clip  # (k, T)
 
-    for _ in range(max_iter):
+    for it in range(max_iter):
+        H_prev = H
         # Multiplicative update: H <- H * (W^T V) / (W^T W H + eps)
         denom = WtW @ H + eps
         H = H * (WtV / denom)
+
+        if (it + 1) % check_every == 0:
+            delta = (H - H_prev).norm() / (H.norm() + eps)
+            if delta < tol:
+                break
 
     return H
 
 
 def gpu_nnls_batch(W: torch.Tensor, V_batch: torch.Tensor,
-                   max_iter: int = 200) -> torch.Tensor:
+                   max_iter: int = 200, tol: float = 1e-6,
+                   check_every: int = 20) -> torch.Tensor:
     """Solve NNLS for a batch of clips simultaneously.
 
     W: (f, k)
     V_batch: (batch, f, T)
     Returns H_batch: (batch, k, T)
+
+    Checks convergence every `check_every` iterations and stops early
+    when the max relative change across the batch drops below `tol`.
     """
     eps = 1e-10
     B, f, T = V_batch.shape
@@ -79,10 +92,18 @@ def gpu_nnls_batch(W: torch.Tensor, V_batch: torch.Tensor,
 
     WtW = W.T @ W  # (k, k)
     WtV = torch.bmm(W.T.unsqueeze(0).expand(B, -1, -1), V_batch)  # (B, k, T)
+    WtW_B = WtW.unsqueeze(0).expand(B, -1, -1)  # pre-expand once
 
-    for _ in range(max_iter):
-        denom = torch.bmm(WtW.unsqueeze(0).expand(B, -1, -1), H) + eps  # (B, k, T)
+    for it in range(max_iter):
+        H_prev = H
+        denom = torch.bmm(WtW_B, H) + eps  # (B, k, T)
         H = H * (WtV / denom)
+
+        if (it + 1) % check_every == 0:
+            # Max relative change across batch
+            delta = (H - H_prev).reshape(B, -1).norm(dim=1).max() / (H.reshape(B, -1).norm(dim=1).max() + eps)
+            if delta < tol:
+                break
 
     return H
 

@@ -155,9 +155,9 @@ class BirdCLEFWrapper(pl.LightningModule):
             apply_spec_aug=self.training,
             return_mel=distill_active,
         )
-        pred = output_dict["clipwise_output"]
-        logits = output_dict["logits"]
-        supervised_loss = self._safe_supervised_loss(logits, target)
+        # Use all_logits (includes hard-negative classes) for training loss
+        all_logits = output_dict["all_logits"]
+        supervised_loss = self._safe_supervised_loss(all_logits, target)
 
         total_loss = supervised_loss
         distill_loss = torch.tensor(0.0, device=waveform.device)
@@ -339,6 +339,20 @@ def main():
     parser.add_argument("--pseudo_labels", type=str, default=None)
     parser.add_argument("--balance_alpha", type=float, default=0.5)
 
+    parser.add_argument("--distill_manifest", type=str, default=None,
+                        help="Path to distill_manifest.csv for supplemental audio")
+    parser.add_argument("--hard_negatives", dest="hard_negatives", action="store_true",
+                        help="Include non-target species as extra training classes")
+    parser.add_argument("--no_hard_negatives", dest="hard_negatives", action="store_false")
+    parser.set_defaults(hard_negatives=True)
+
+    parser.add_argument("--bg_mix_prob", type=float, default=0.0,
+                        help="Probability of mixing soundscape background noise per sample")
+    parser.add_argument("--bg_snr_min", type=float, default=3.0,
+                        help="Minimum SNR (dB) for background mixing")
+    parser.add_argument("--bg_snr_max", type=float, default=15.0,
+                        help="Maximum SNR (dB) for background mixing")
+
     parser.add_argument("--min_duration", type=float, default=3.0)
     parser.add_argument("--max_duration", type=float, default=30.0)
     parser.add_argument("--full_files", dest="full_files", action="store_true")
@@ -364,7 +378,8 @@ def main():
     if args.full_files:
         logger.info("Full-file mode enabled for train_audio (no cropping)")
 
-    train_loader, val_loader, label_map, num_classes, n_train_audio = get_dataloaders(
+    (train_loader, val_loader, label_map, num_classes,
+     n_train_audio, num_train_classes) = get_dataloaders(
         args.data_dir,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -382,18 +397,26 @@ def main():
         pseudo_labels_csv=args.pseudo_labels,
         balance_alpha=args.balance_alpha,
         full_files=args.full_files,
+        distill_manifest=args.distill_manifest,
+        hard_negatives=args.hard_negatives,
+        bg_mix_prob=args.bg_mix_prob,
+        bg_snr_range=(args.bg_snr_min, args.bg_snr_max),
     )
-    logger.info(f"Classes: {num_classes}, Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
+
+    logger.info(f"Target classes: {num_classes}, Train classes: {num_train_classes}, "
+                f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
     model = BirdCLEFModel(
         num_classes=num_classes,
+        num_train_classes=num_train_classes,
         sample_rate=32000,
         birdset_model_name=args.birdset_model_name,
         max_time_frames=args.max_time_frames,
         chunk_hop_frames=args.chunk_hop_frames,
         pretrained=True,
     )
-    logger.info(f"Model params: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
+    logger.info(f"Model params: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M"
+                f" (head outputs {num_train_classes} classes)")
 
     teacher = _build_teacher(args.birdset_model_name) if args.distill else None
 
@@ -459,6 +482,12 @@ def main():
                 "max_duration": args.max_duration,
                 "full_files": args.full_files,
                 "n_train_audio": n_train_audio,
+                "distill_manifest": args.distill_manifest,
+                "hard_negatives": args.hard_negatives,
+                "num_train_classes": num_train_classes,
+                "bg_mix_prob": args.bg_mix_prob,
+                "bg_snr_min": args.bg_snr_min,
+                "bg_snr_max": args.bg_snr_max,
             },
         )
         loggers.append(wandb_logger)

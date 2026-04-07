@@ -77,9 +77,14 @@ MAX_DURATION="${MAX_DURATION:-5.0}"
 FULL_FILES="${FULL_FILES:-0}"
 MIX_PROB="${MIX_PROB:-0.0}"
 MIXUP_ALPHA="${MIXUP_ALPHA:-0.0}"
-DISTILL="${DISTILL:-1}"
+DISTILL="${DISTILL:-0}"
 DISTILL_WEIGHT="${DISTILL_WEIGHT:-0.15}"
 DISTILL_TEMP="${DISTILL_TEMP:-2.0}"
+DISTILL_MANIFEST="${DISTILL_MANIFEST:-$PROJECT_DIR/data/distill_manifest.csv}"
+HARD_NEGATIVES="${HARD_NEGATIVES:-1}"
+BG_MIX_PROB="${BG_MIX_PROB:-0.5}"
+BG_SNR_MIN="${BG_SNR_MIN:-3.0}"
+BG_SNR_MAX="${BG_SNR_MAX:-15.0}"
 MAX_TIME_FRAMES="${MAX_TIME_FRAMES:-768}"
 CHUNK_HOP_FRAMES="${CHUNK_HOP_FRAMES:-512}"
 PRECISION="${PRECISION:-bf16}"
@@ -113,6 +118,17 @@ if [ "$DISTILL" = "1" ]; then
     DISTILL_ARG="--distill"
 fi
 
+DISTILL_MANIFEST_ARG=""
+if [ -n "$DISTILL_MANIFEST" ] && [ -f "$DISTILL_MANIFEST" ]; then
+    echo "Using distill data: $DISTILL_MANIFEST"
+    DISTILL_MANIFEST_ARG="--distill_manifest $DISTILL_MANIFEST"
+fi
+
+HARD_NEG_ARG="--hard_negatives"
+if [ "$HARD_NEGATIVES" = "0" ]; then
+    HARD_NEG_ARG="--no_hard_negatives"
+fi
+
 python src/train.py \
     --data_dir "$PROJECT_DIR/data" \
     --birdset_model_name "$BIRDSET_MODEL" \
@@ -144,6 +160,11 @@ python src/train.py \
     --valid_regions "$VALID_REGIONS" \
     $FULL_FILES_ARG \
     $RESUME_ARG \
-    $PSEUDO_ARG
+    $PSEUDO_ARG \
+    $DISTILL_MANIFEST_ARG \
+    $HARD_NEG_ARG \
+    --bg_mix_prob "$BG_MIX_PROB" \
+    --bg_snr_min "$BG_SNR_MIN" \
+    --bg_snr_max "$BG_SNR_MAX"
 
 echo "Training complete (run=$RUN_ID, fold=$FOLD)."

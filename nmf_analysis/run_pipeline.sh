@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=nmf_analysis
 #SBATCH --output=nmf_analysis/slurm-%j.out
-#SBATCH --time=06:00:00
+#SBATCH --time=10:00:00
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=8
 #SBATCH --partition=l40s
@@ -39,9 +39,9 @@ echo ""
 echo "=== Step 2: Run NMFk rank selection ==="
 python nmf_analysis/run_nmfk.py \
     --input-dir nmf_analysis/output \
-    --k-min 52 \
-    --k-max 60 \
-    --k-step 1 \
+    --k-min 20 \
+    --k-max 80 \
+    --k-step 5 \
     --n-runs 10 \
     --algo hals \
     --perturb-std 0.01

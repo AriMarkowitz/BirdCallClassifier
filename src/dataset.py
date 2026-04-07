@@ -271,6 +271,97 @@ class TrainAudioDataset(Dataset):
         return audio.copy().astype(np.float32)
 
 
+class SoundscapeBackgroundMix(Dataset):
+    """Wraps any dataset to mix in random crops from unlabeled soundscape files.
+
+    This bridges the domain gap between clean focal recordings (train_audio)
+    and noisy test soundscapes by adding real background noise at random SNR.
+    Labels are unchanged because the background is unlabeled.
+
+    Args:
+        base_dataset: any dataset returning {"waveform": ..., "target": ...}
+        soundscape_dir: path to train_soundscapes/ directory
+        sample_rate: target sample rate
+        mix_prob: probability of mixing background per sample (0-1)
+        snr_range: (min_snr_db, max_snr_db) — signal-to-noise ratio range.
+            Lower SNR = more background noise. Typical range: (3, 15) dB.
+    """
+
+    def __init__(self, base_dataset, soundscape_dir, sample_rate=32000,
+                 mix_prob=0.5, snr_range=(3.0, 15.0)):
+        self.base = base_dataset
+        self.sample_rate = sample_rate
+        self.mix_prob = mix_prob
+        self.snr_min, self.snr_max = snr_range
+
+        # Collect all soundscape file paths
+        self.bg_files = []
+        if os.path.isdir(soundscape_dir):
+            for f in os.listdir(soundscape_dir):
+                if f.endswith(('.ogg', '.wav', '.flac', '.mp3')):
+                    self.bg_files.append(os.path.join(soundscape_dir, f))
+        logger.info(f"SoundscapeBackgroundMix: {len(self.bg_files)} background files, "
+                     f"mix_prob={mix_prob}, SNR={snr_range}")
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, index):
+        sample = self.base[index]
+
+        if not self.bg_files or np.random.rand() >= self.mix_prob:
+            return sample
+
+        waveform = sample["waveform"].copy()
+        target = sample["target"]
+        clip_len = len(waveform)
+
+        # Load a random crop from a random soundscape file
+        bg_path = self.bg_files[np.random.randint(len(self.bg_files))]
+        try:
+            info = sf.info(bg_path)
+            bg_total = int(info.frames)
+            sr = info.samplerate
+
+            # Pick a random start position
+            need_frames = int(clip_len * sr / self.sample_rate)
+            if bg_total > need_frames:
+                start = np.random.randint(0, bg_total - need_frames)
+            else:
+                start = 0
+            bg_audio, bg_sr = sf.read(bg_path, start=start,
+                                       frames=min(need_frames, bg_total),
+                                       dtype="float32")
+            if bg_audio.ndim > 1:
+                bg_audio = bg_audio.mean(axis=1)
+            if bg_sr != self.sample_rate:
+                bg_audio = librosa.resample(bg_audio, orig_sr=bg_sr,
+                                            target_sr=self.sample_rate)
+        except Exception:
+            return sample
+
+        # Pad or truncate background to match clip length
+        if len(bg_audio) > clip_len:
+            bg_audio = bg_audio[:clip_len]
+        elif len(bg_audio) < clip_len:
+            pad = np.zeros(clip_len - len(bg_audio), dtype=np.float32)
+            bg_audio = np.concatenate([bg_audio, pad])
+
+        # Mix at random SNR
+        sig_power = max(np.mean(waveform ** 2), 1e-10)
+        bg_power = max(np.mean(bg_audio ** 2), 1e-10)
+        snr_db = np.random.uniform(self.snr_min, self.snr_max)
+        # Scale background so that 10*log10(sig/bg_scaled) = snr_db
+        target_bg_power = sig_power / (10.0 ** (snr_db / 10.0))
+        gain = np.sqrt(target_bg_power / bg_power)
+        waveform = waveform + gain * bg_audio
+
+        return {
+            "waveform": waveform.astype(np.float32),
+            "target": target,
+        }
+
+
 class MultiSpeciesMixDataset(Dataset):
     """
     Wraps a TrainAudioDataset to create synthetic polyphonic mixtures.
@@ -415,6 +506,136 @@ class SoundscapeDataset(Dataset):
         }
 
 
+class DistillAudioDataset(Dataset):
+    """Loads supplemental audio from distill_audio/ using distill_manifest.csv.
+
+    Maps species to class indices:
+      - Species matching the BirdCLEF taxonomy get their standard index (0..num_target-1).
+      - Extra species get indices num_target..num_target+N (hard negatives).
+      - If hard_negatives=False, only matched species are loaded.
+
+    Args:
+        manifest_path: path to distill_manifest.csv
+        distill_dir: root directory containing distill_audio/ files
+        target_label_map: {primary_label: idx} for the 234 BirdCLEF classes
+        taxonomy_path: path to taxonomy.csv (to map scientific_name -> primary_label)
+        sample_rate: target sample rate
+        min_duration: minimum clip duration in seconds
+        max_duration: maximum clip duration in seconds
+        label_smoothing: label smoothing epsilon
+        hard_negatives: if True, include non-target species as extra classes
+    """
+
+    def __init__(self, manifest_path, distill_dir, target_label_map, taxonomy_path,
+                 sample_rate=32000,
+                 min_duration=DEFAULT_MIN_DURATION,
+                 max_duration=DEFAULT_MAX_DURATION,
+                 label_smoothing=0.0,
+                 hard_negatives=True):
+        self.distill_dir = distill_dir
+        self.sample_rate = sample_rate
+        self.min_samples = int(sample_rate * min_duration)
+        self.max_samples = int(sample_rate * max_duration)
+        self.label_smoothing = label_smoothing
+
+        # Build scientific_name -> primary_label mapping from taxonomy
+        tax_df = pd.read_csv(taxonomy_path)
+        sci_to_primary = {}
+        for _, row in tax_df.iterrows():
+            sci_to_primary[str(row["scientific_name"]).strip().lower()] = str(row["primary_label"])
+
+        # Read manifest and assign class indices
+        manifest_df = pd.read_csv(manifest_path)
+
+        # Map species_name (scientific name) to target label index or extra index
+        extra_species = {}  # species_name -> extra_class_idx
+        next_extra_idx = len(target_label_map)
+
+        self.entries = []
+        self.num_target_classes = len(target_label_map)
+
+        for _, row in manifest_df.iterrows():
+            species_name = str(row.get("species_name", "")).strip()
+            rel_path = str(row.get("relative_path", "")).strip()
+            if not species_name or not rel_path:
+                continue
+
+            # Try to match to BirdCLEF taxonomy
+            primary_label = sci_to_primary.get(species_name.lower())
+            if primary_label and primary_label in target_label_map:
+                class_idx = target_label_map[primary_label]
+            elif hard_negatives:
+                # Assign a hard-negative class index
+                if species_name not in extra_species:
+                    extra_species[species_name] = next_extra_idx
+                    next_extra_idx += 1
+                class_idx = extra_species[species_name]
+            else:
+                continue  # skip non-target species
+
+            audio_path = os.path.join(distill_dir, rel_path)
+            if not os.path.isfile(audio_path):
+                continue
+
+            self.entries.append({
+                "audio_path": audio_path,
+                "class_idx": class_idx,
+                "species_name": species_name,
+            })
+
+        self.num_extra_classes = len(extra_species)
+        self.num_classes = self.num_target_classes + self.num_extra_classes
+        self.extra_species_map = extra_species  # species_name -> idx
+
+        logger.info(
+            f"DistillAudioDataset: {len(self.entries)} files, "
+            f"{self.num_target_classes} target classes matched, "
+            f"{self.num_extra_classes} extra hard-negative classes"
+        )
+
+        # Pre-compute targets
+        eps = label_smoothing
+        self._targets = np.full(
+            (len(self.entries), self.num_classes),
+            eps / self.num_classes, dtype=np.float32
+        )
+        for i, entry in enumerate(self.entries):
+            self._targets[i, entry["class_idx"]] = 1.0 - eps
+
+    def __len__(self):
+        return len(self.entries)
+
+    def __getitem__(self, index):
+        entry = self.entries[index]
+        audio = self._load_audio(entry["audio_path"])
+        audio = self._fit_length(audio)
+        return {
+            "waveform": audio,
+            "target": self._targets[index].copy(),
+        }
+
+    def _load_audio(self, path):
+        try:
+            audio, sr = sf.read(path, dtype="float32")
+        except Exception:
+            audio, sr = librosa.load(path, sr=self.sample_rate, mono=True)
+            return audio.astype(np.float32)
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        if sr != self.sample_rate:
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=self.sample_rate)
+        return audio.astype(np.float32)
+
+    def _fit_length(self, audio):
+        if len(audio) > self.max_samples:
+            start = np.random.randint(0, len(audio) - self.max_samples)
+            return audio[start:start + self.max_samples].astype(np.float32)
+        elif len(audio) < self.min_samples:
+            pad = np.zeros(self.min_samples - len(audio), dtype=np.float32)
+            return np.concatenate([audio, pad]).astype(np.float32)
+        return audio.copy().astype(np.float32)
+
+
 def get_datasets(data_dir, sample_rate=32000,
                  min_duration=DEFAULT_MIN_DURATION,
                  max_duration=DEFAULT_MAX_DURATION,
@@ -422,7 +643,9 @@ def get_datasets(data_dir, sample_rate=32000,
                  seed=42, label_smoothing=0.0, n_folds=5, fold=0,
                  multi_mix=True, mix_prob=0.7, preload=False,
                  valid_regions_path=None, pseudo_labels_csv=None,
-                 full_files=True):
+                 full_files=True,
+                 distill_manifest=None, hard_negatives=True,
+                 bg_mix_prob=0.0, bg_snr_range=(3.0, 15.0)):
     """
     Build train/val datasets with k-fold CV.
 
@@ -444,7 +667,8 @@ def get_datasets(data_dir, sample_rate=32000,
         mix_prob: probability of mixing per sample (0-1)
 
     Returns:
-        train_dataset, val_dataset, label_map, num_classes, n_train_audio, n_soundscape_train
+        train_dataset, val_dataset, label_map, num_classes, n_train_audio, n_soundscape_train,
+        split_info (dict with num_train_classes — may be > num_classes when hard negatives enabled)
     """
     taxonomy_path = os.path.join(data_dir, "taxonomy.csv")
     train_csv = os.path.join(data_dir, "train.csv")
@@ -539,6 +763,14 @@ def get_datasets(data_dir, sample_rate=32000,
     else:
         audio_train_mixed = audio_train_sub
 
+    # Wrap train audio with soundscape background noise injection
+    if bg_mix_prob > 0:
+        audio_train_mixed = SoundscapeBackgroundMix(
+            audio_train_mixed, soundscape_dir,
+            sample_rate=sample_rate, mix_prob=bg_mix_prob,
+            snr_range=bg_snr_range,
+        )
+
     # --- Soundscape segments: stratified k-fold split ---
     soundscape_ds_gt = SoundscapeDataset(
         soundscape_csv, soundscape_dir, label_map,
@@ -631,13 +863,85 @@ def get_datasets(data_dir, sample_rate=32000,
     else:
         sc_train = sc_train_gt
 
+    # --- Distill data (supplemental audio) ---
+    distill_ds = None
+    num_train_classes = num_classes  # may grow if hard negatives enabled
+    if distill_manifest and os.path.isfile(distill_manifest):
+        distill_dir = os.path.join(data_dir, "distill_audio")
+        distill_ds = DistillAudioDataset(
+            manifest_path=distill_manifest,
+            distill_dir=distill_dir,
+            target_label_map=label_map,
+            taxonomy_path=taxonomy_path,
+            sample_rate=sample_rate,
+            min_duration=min_duration,
+            max_duration=max_duration,
+            label_smoothing=label_smoothing,
+            hard_negatives=hard_negatives,
+        )
+        num_train_classes = distill_ds.num_classes
+        logger.info(f"Distill data: {len(distill_ds)} files, "
+                     f"num_train_classes={num_train_classes} "
+                     f"(+{distill_ds.num_extra_classes} hard negatives)")
+    elif distill_manifest:
+        logger.warning(f"Distill manifest not found: {distill_manifest}")
+
+    # --- Pad targets to num_train_classes if distill added extra classes ---
+    # All existing datasets have targets of size num_classes (234).
+    # If distill adds hard negatives, we need a wrapper to zero-pad targets.
+    class _PadTargetDataset(Dataset):
+        """Wraps a dataset to zero-pad targets from num_classes to num_train_classes."""
+        def __init__(self, ds, target_size):
+            self.ds = ds
+            self.target_size = target_size
+        def __len__(self):
+            return len(self.ds)
+        def __getitem__(self, idx):
+            sample = self.ds[idx]
+            t = sample["target"]
+            if len(t) < self.target_size:
+                padded = np.zeros(self.target_size, dtype=np.float32)
+                padded[:len(t)] = t
+                sample = {**sample, "target": padded}
+            return sample
+
     # --- Combine ---
     n_train_audio = len(audio_train_mixed)
-    train_ds = ConcatDataset([audio_train_mixed, sc_train])
+    train_parts = [audio_train_mixed, sc_train]
+
+    if distill_ds is not None and len(distill_ds) > 0:
+        if bg_mix_prob > 0:
+            distill_ds_aug = SoundscapeBackgroundMix(
+                distill_ds, soundscape_dir,
+                sample_rate=sample_rate, mix_prob=bg_mix_prob,
+                snr_range=bg_snr_range,
+            )
+            train_parts.append(distill_ds_aug)
+        else:
+            train_parts.append(distill_ds)
+
+    if num_train_classes > num_classes:
+        # Pad targets for datasets that output num_classes-sized targets.
+        # Distill datasets (and their wrappers) already output num_train_classes.
+        def _needs_pad(ds):
+            """Check if dataset outputs targets smaller than num_train_classes."""
+            try:
+                t = ds[0]["target"]
+                return len(t) < num_train_classes
+            except Exception:
+                return True
+        train_parts = [_PadTargetDataset(ds, num_train_classes)
+                       if _needs_pad(ds) else ds
+                       for ds in train_parts]
+
+    train_ds = ConcatDataset(train_parts)
+
+    # Val stays at num_classes — we only evaluate on target classes
     val_ds = ConcatDataset([audio_val_sub, sc_val])
 
     logger.info(f"Fold {fold}/{n_folds}: "
-                f"Train = {n_train_audio} audio (mixed) + {len(sc_train)} soundscape, "
+                f"Train = {n_train_audio} audio (mixed) + {len(sc_train)} soundscape"
+                f"{f' + {len(distill_ds)} distill' if distill_ds else ''}, "
                 f"Val = {len(audio_val_sub)} audio + {len(sc_val)} soundscape")
 
     split_info = {
@@ -646,6 +950,8 @@ def get_datasets(data_dir, sample_rate=32000,
         "soundscape_ds_gt": soundscape_ds_gt,
         "sc_train_indices": sc_train_indices,
         "pseudo_ds": pseudo_ds,
+        "distill_ds": distill_ds,
+        "num_train_classes": num_train_classes,
     }
 
     return train_ds, val_ds, label_map, num_classes, n_train_audio, len(sc_train), split_info
@@ -676,17 +982,19 @@ def _build_class_balanced_sampler(split_info, num_classes, n_train_audio, n_sc_t
 
     The ConcatDataset layout is:
       [0 .. n_train_audio-1]  = train audio (mixed)
-      [n_train_audio .. n_train_audio + n_sc_gt_train - 1] = ground-truth soundscapes
-      [n_train_audio + n_sc_gt_train .. end] = pseudo-labeled soundscapes (if any)
+      [n_train_audio .. n_train_audio + n_sc_train - 1] = soundscapes (gt + pseudo)
+      [n_train_audio + n_sc_train .. end] = distill audio (if any)
     """
     audio_ds = split_info["audio_ds"]
     audio_train_idx = split_info["audio_train_idx"]
     soundscape_ds_gt = split_info["soundscape_ds_gt"]
     sc_train_indices = split_info["sc_train_indices"]
     pseudo_ds = split_info.get("pseudo_ds")
+    distill_ds = split_info.get("distill_ds")
+    num_train_classes = split_info.get("num_train_classes", num_classes)
 
-    # Count class frequencies across all training samples
-    class_counts = np.zeros(num_classes, dtype=np.float64)
+    # Count class frequencies across all training samples (over all train classes)
+    class_counts = np.zeros(num_train_classes, dtype=np.float64)
 
     for idx in audio_train_idx:
         label_idx = audio_ds.label_map[audio_ds.labels[idx]]
@@ -705,10 +1013,15 @@ def _build_class_balanced_sampler(split_info, num_classes, n_train_audio, n_sc_t
         for label_idx in entry["label_indices"]:
             class_counts[label_idx] += 1
 
+    n_distill = len(distill_ds) if distill_ds else 0
+    if distill_ds:
+        for entry in distill_ds.entries:
+            class_counts[entry["class_idx"]] += 1
+
     class_counts = np.maximum(class_counts, 1.0)
     class_weights = (1.0 / class_counts) ** balance_alpha
 
-    n_total = n_train_audio + n_sc_train
+    n_total = n_train_audio + n_sc_train + n_distill
     sample_weights = np.ones(n_total, dtype=np.float64)
 
     for i, idx in enumerate(audio_train_idx):
@@ -728,16 +1041,23 @@ def _build_class_balanced_sampler(split_info, num_classes, n_train_audio, n_sc_t
         w = max(class_weights[li] for li in entry["label_indices"])
         sample_weights[n_train_audio + n_sc_gt + i] = w
 
+    if distill_ds:
+        offset = n_train_audio + n_sc_train
+        for i, entry in enumerate(distill_ds.entries):
+            sample_weights[offset + i] = class_weights[entry["class_idx"]]
+
     sampler = WeightedRandomSampler(
         weights=sample_weights, num_samples=n_total, replacement=True
     )
 
-    min_c, max_c = class_counts.min(), class_counts.max()
+    min_c, max_c = class_counts[:num_classes].min(), class_counts[:num_classes].max()
     logger.info(f"Class-balanced sampler (alpha={balance_alpha}): "
-                f"class counts range [{min_c:.0f}, {max_c:.0f}], "
+                f"target class counts range [{min_c:.0f}, {max_c:.0f}], "
                 f"weight range [{sample_weights.min():.4f}, {sample_weights.max():.4f}]")
     if n_pseudo > 0:
         logger.info(f"  (includes {n_pseudo} pseudo-labeled segments)")
+    if n_distill > 0:
+        logger.info(f"  (includes {n_distill} distill audio files)")
 
     return sampler
 
@@ -750,7 +1070,9 @@ def get_dataloaders(data_dir, batch_size=32, num_workers=4, sample_rate=32000,
                     n_folds=5, fold=0, multi_mix=True, mix_prob=0.7,
                     preload=False, valid_regions_path=None,
                     pseudo_labels_csv=None, balance_alpha=0.5,
-                    full_files=True):
+                    full_files=True,
+                    distill_manifest=None, hard_negatives=True,
+                    bg_mix_prob=0.0, bg_snr_range=(3.0, 15.0)):
     """
     Convenience function returning DataLoaders ready for training.
 
@@ -765,6 +1087,8 @@ def get_dataloaders(data_dir, batch_size=32, num_workers=4, sample_rate=32000,
         preload=preload, valid_regions_path=valid_regions_path,
         pseudo_labels_csv=pseudo_labels_csv,
         full_files=full_files,
+        distill_manifest=distill_manifest, hard_negatives=hard_negatives,
+        bg_mix_prob=bg_mix_prob, bg_snr_range=bg_snr_range,
     )
 
     sampler = _build_class_balanced_sampler(
@@ -796,4 +1120,5 @@ def get_dataloaders(data_dir, batch_size=32, num_workers=4, sample_rate=32000,
         collate_fn=variable_length_collate_fn,
     )
 
-    return train_loader, val_loader, label_map, num_classes, n_audio
+    num_train_classes = split_info.get("num_train_classes", num_classes)
+    return train_loader, val_loader, label_map, num_classes, n_audio, num_train_classes

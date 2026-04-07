@@ -107,14 +107,27 @@ def load_model(checkpoint_path):
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state_dict = ckpt["state_dict"]
 
+    model_dict = {k.replace("model.", "", 1): v
+                  for k, v in state_dict.items() if k.startswith("model.")}
+
+    # Detect if checkpoint was trained with hard-negative extra classes
+    # by checking the final head layer output size
+    head_weight_key = "head.5.weight"
+    num_train_classes = NUM_CLASSES
+    if head_weight_key in model_dict:
+        ckpt_out_classes = model_dict[head_weight_key].shape[0]
+        if ckpt_out_classes > NUM_CLASSES:
+            num_train_classes = ckpt_out_classes
+            print(f"  Checkpoint has {ckpt_out_classes} train classes "
+                  f"(target: {NUM_CLASSES}, extra: {ckpt_out_classes - NUM_CLASSES})")
+
     model = BirdCLEFModel(
         num_classes=NUM_CLASSES,
+        num_train_classes=num_train_classes,
         sample_rate=SAMPLE_RATE,
         birdset_model_name=BIRDSET_MODEL_DIR,
         pretrained=False,
     )
-    model_dict = {k.replace("model.", "", 1): v
-                  for k, v in state_dict.items() if k.startswith("model.")}
     missing, unexpected = model.load_state_dict(model_dict, strict=True)
     assert not missing, f"Missing keys loading {os.path.basename(checkpoint_path)}: {missing}"
     model.eval()

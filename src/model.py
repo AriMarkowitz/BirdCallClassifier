@@ -138,6 +138,7 @@ class BirdCLEFModel(nn.Module):
         pretrained=True,
         attn_heads=8,
         attn_dropout=0.0,
+        num_train_classes=None,
     ):
         super().__init__()
         if EfficientNetForImageClassification is None:
@@ -147,6 +148,10 @@ class BirdCLEFModel(nn.Module):
             ) from _TRANSFORMERS_IMPORT_ERROR
 
         self.num_classes = num_classes
+        # num_train_classes >= num_classes when hard-negative extra classes are used.
+        # The head outputs num_train_classes logits during training; at inference,
+        # only the first num_classes are used.
+        self.num_train_classes = num_train_classes or num_classes
         self.sample_rate = sample_rate
         self.max_time_frames = int(max_time_frames)
         self.chunk_hop_frames = int(chunk_hop_frames)
@@ -215,13 +220,14 @@ class BirdCLEFModel(nn.Module):
         )
 
         # MLP head on attended 1280-dim features.
+        # Outputs num_train_classes logits (>= num_classes if hard negatives).
         self.head = nn.Sequential(
             nn.Dropout(0.3),
             nn.Linear(hidden_dim, 512),
             nn.BatchNorm1d(512),
             nn.GELU(),
             nn.Dropout(0.2),
-            nn.Linear(512, num_classes),
+            nn.Linear(512, self.num_train_classes),
         )
 
     def _compute_birdset_mel(self, x):
@@ -352,11 +358,15 @@ class BirdCLEFModel(nn.Module):
             pooled, attn_weights, student_birdset_logits = fwd
             mel_clean = None
 
-        logits = self.head(pooled)
+        all_logits = self.head(pooled)
+
+        # Slice to target classes only for clipwise_output / logits
+        target_logits = all_logits[:, :self.num_classes]
 
         output = {
-            "clipwise_output": torch.sigmoid(logits),
-            "logits": logits,
+            "clipwise_output": torch.sigmoid(target_logits),
+            "logits": target_logits,
+            "all_logits": all_logits,  # includes hard-negative classes
             "latent_output": pooled,
             "student_birdset_logits": student_birdset_logits,
             "attn_weights": attn_weights,
