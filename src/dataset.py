@@ -75,8 +75,9 @@ def variable_length_collate_fn(batch):
     # Pass through teacher logits if any sample has them (pseudo-label distillation).
     # Samples without logits get zeros; a mask indicates which samples have real logits.
     if any("teacher_logits" in s for s in batch):
-        n_classes = batch[0]["target"].shape[0]
-        logits = np.zeros((len(batch), n_classes), dtype=np.float32)
+        # Find the actual teacher logits size (may differ from target size due to padding)
+        tl_size = next(s["teacher_logits"].shape[0] for s in batch if "teacher_logits" in s)
+        logits = np.zeros((len(batch), tl_size), dtype=np.float32)
         mask = np.zeros(len(batch), dtype=np.float32)
         for i, s in enumerate(batch):
             if "teacher_logits" in s:
