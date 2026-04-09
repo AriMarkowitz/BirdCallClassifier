@@ -3,15 +3,18 @@ Generate pseudo-labels for unlabeled soundscape files.
 
 Runs a trained BirdCLEF EfficientNet model on all unlabeled soundscape files
 in 5-second sliding windows, filters predictions by confidence threshold,
-and outputs a CSV in the same format as train_soundscapes_labels.csv so
-SoundscapeDataset can load it directly.
+and outputs:
+  1. A CSV with columns: filename, start, end, primary_label (for compatibility)
+  2. A .npz file with raw logits for each kept segment, enabling logit-based
+     distillation during retraining (much richer signal than hard labels).
 
 Usage:
     python scripts/pseudo_label.py \
         --checkpoint checkpoints/best.ckpt \
         --data-dir data \
         --output data/pseudo_labels.csv \
-        --threshold 0.8
+        --threshold 0.8 \
+        --max-per-species 500
 """
 
 import argparse
@@ -19,7 +22,7 @@ import json
 import logging
 import os
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import librosa
@@ -45,12 +48,6 @@ SEGMENT_SAMPLES = int(SAMPLE_RATE * SEGMENT_DURATION)
 
 def load_model(checkpoint_path, num_classes, device):
     """Load a trained BirdCLEFWrapper from a Lightning checkpoint."""
-    model = BirdCLEFModel(
-        num_classes=num_classes,
-        sample_rate=SAMPLE_RATE,
-        pretrained=False,  # weights come from checkpoint
-    )
-
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state_dict = ckpt.get("state_dict", ckpt)
 
@@ -61,11 +58,26 @@ def load_model(checkpoint_path, num_classes, device):
         k = k.replace("model.", "", 1) if k.startswith("model.") else k
         cleaned[k] = v
 
-    missing, unexpected = model.load_state_dict(cleaned, strict=False)
+    # Detect if checkpoint was trained with hard-negative extra classes
+    head_weight_key = "head.5.weight"
+    num_train_classes = num_classes
+    if head_weight_key in cleaned:
+        ckpt_out_classes = cleaned[head_weight_key].shape[0]
+        if ckpt_out_classes > num_classes:
+            num_train_classes = ckpt_out_classes
+            logger.info(f"  Checkpoint has {ckpt_out_classes} train classes "
+                        f"(target: {num_classes}, extra: {ckpt_out_classes - num_classes})")
+
+    model = BirdCLEFModel(
+        num_classes=num_classes,
+        num_train_classes=num_train_classes,
+        sample_rate=SAMPLE_RATE,
+        pretrained=False,
+    )
+
+    missing, unexpected = model.load_state_dict(cleaned, strict=True)
+    assert not missing, f"Missing keys loading {checkpoint_path}: {missing}"
     logger.info(f"Loaded checkpoint: {checkpoint_path}")
-    logger.info(f"  Missing: {len(missing)}, Unexpected: {len(unexpected)}")
-    if missing:
-        logger.debug(f"  Missing keys: {missing[:10]}")
 
     model = model.to(device)
     model.eval()
@@ -102,7 +114,8 @@ def predict_file(model, audio, device, batch_size=32):
 
     Returns:
         segments: list of (start_sec, end_sec)
-        probs: np.array of shape (n_segments, num_classes)
+        probs: np.array of shape (n_segments, num_classes) — sigmoid probabilities
+        logits: np.array of shape (n_segments, num_classes) — raw pre-sigmoid logits
     """
     n_samples = len(audio)
     segments = []
@@ -118,21 +131,23 @@ def predict_file(model, audio, device, batch_size=32):
         segments.append((start / SAMPLE_RATE, end / SAMPLE_RATE))
 
     if not waveforms:
-        return [], np.array([])
+        return [], np.array([]), np.array([])
 
     # Batch inference — all segments are same length (5s) so no padding needed
     all_probs = []
+    all_logits = []
     for i in range(0, len(waveforms), batch_size):
         batch = np.stack(waveforms[i:i + batch_size])
         batch_tensor = torch.from_numpy(batch).to(device)
 
         with torch.no_grad():
             output = model(batch_tensor)
-            clipwise = output["clipwise_output"]
-            all_probs.append(clipwise.cpu().numpy())
+            all_probs.append(output["clipwise_output"].cpu().numpy())
+            all_logits.append(output["logits"].cpu().numpy())
 
     probs = np.concatenate(all_probs, axis=0)
-    return segments, probs
+    logits = np.concatenate(all_logits, axis=0)
+    return segments, probs, logits
 
 
 def main():
@@ -142,6 +157,9 @@ def main():
     parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--output", type=str, default="data/pseudo_labels.csv")
     parser.add_argument("--threshold", type=float, default=0.8)
+    parser.add_argument("--max-per-species", type=int, default=0,
+                        help="Max pseudo-labeled segments per species (0=unlimited). "
+                             "Keeps highest-confidence segments when capping.")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--use_wandb", action="store_true")
@@ -196,6 +214,7 @@ def main():
     # --- Run inference ---
     rows_soundscape = []
     rows_train_audio = []
+    logits_list = []  # raw logits for each kept segment
     n_segments_total = 0
     n_segments_kept = 0
     all_max_confs = []
@@ -209,9 +228,9 @@ def main():
             logger.warning(f"Skipping {fn}: {e}")
             continue
 
-        segments, probs = predict_file(model, audio, device, batch_size=args.batch_size)
+        segments, probs, logits = predict_file(model, audio, device, batch_size=args.batch_size)
 
-        for (start_sec, end_sec), prob in zip(segments, probs):
+        for (start_sec, end_sec), prob, logit in zip(segments, probs, logits):
             n_segments_total += 1
             max_conf = float(prob.max())
             all_max_confs.append(max_conf)
@@ -234,6 +253,7 @@ def main():
                 "end": seconds_to_timestr(end_sec),
                 "primary_label": label_str,
             })
+            logits_list.append(logit.astype(np.float16))
 
     logger.info(f"Soundscape pseudo-labeling: {n_segments_kept}/{n_segments_total} segments kept")
 
@@ -248,10 +268,10 @@ def main():
             logger.warning(f"Skipping {fn}: {e}")
             continue
 
-        segments, probs = predict_file(model, audio, device, batch_size=args.batch_size)
+        segments, probs, logits = predict_file(model, audio, device, batch_size=args.batch_size)
 
         known = known_labels_per_file.get(fn, set())
-        for (start_sec, end_sec), prob in zip(segments, probs):
+        for (start_sec, end_sec), prob, logit in zip(segments, probs, logits):
             n_train_segments += 1
 
             above = np.where(prob >= args.threshold)[0]
@@ -277,11 +297,49 @@ def main():
                 "end": seconds_to_timestr(end_sec),
                 "primary_label": label_str,
             })
+            logits_list.append(logit.astype(np.float16))
 
     logger.info(f"Train audio secondary species: {n_train_discoveries}/{n_train_segments} "
                 f"segments with novel species")
 
     rows = rows_soundscape + rows_train_audio
+
+    # --- Per-species cap (keep highest-confidence segments) ---
+    if args.max_per_species > 0 and rows:
+        logger.info(f"Applying per-species cap: max {args.max_per_species} segments per species")
+        pre_cap = len(rows)
+
+        # Build per-species list of (row_idx, max_conf_for_species)
+        species_rows = defaultdict(list)
+        for i, row in enumerate(rows):
+            labels = row["primary_label"].split(";")
+            # Use the logits to get the actual confidence for each species
+            logit_vec = logits_list[i].astype(np.float32)
+            for sp in labels:
+                sp_idx = label_map.get(sp)
+                conf = float(1.0 / (1.0 + np.exp(-logit_vec[sp_idx]))) if sp_idx is not None else 0.0
+                species_rows[sp].append((i, conf))
+
+        # For each over-represented species, find which indices to keep
+        species_top_k = {}
+        for sp, entries in species_rows.items():
+            if len(entries) <= args.max_per_species:
+                species_top_k[sp] = {e[0] for e in entries}
+            else:
+                entries.sort(key=lambda x: -x[1])
+                species_top_k[sp] = {e[0] for e in entries[:args.max_per_species]}
+
+        # A row is kept if at least one of its species still wants it
+        kept_indices = []
+        for i, row in enumerate(rows):
+            labels = row["primary_label"].split(";")
+            if any(i in species_top_k.get(sp, set()) for sp in labels):
+                kept_indices.append(i)
+
+        rows = [rows[i] for i in kept_indices]
+        logits_list = [logits_list[i] for i in kept_indices]
+        logger.info(f"Per-species cap: {pre_cap} -> {len(rows)} rows "
+                     f"({pre_cap - len(kept_indices)} removed)")
 
     # Save CSV
     output_path = Path(args.output)
@@ -290,6 +348,13 @@ def main():
     if rows:
         out_df = pd.DataFrame(rows)
         out_df.to_csv(output_path, index=False)
+
+        # Save raw logits for logit-based distillation during retraining
+        logits_path = output_path.with_suffix(".npz")
+        logits_array = np.stack(logits_list)  # (N, num_classes), float16
+        np.savez_compressed(logits_path, logits=logits_array)
+        logger.info(f"Saved teacher logits: {logits_path} "
+                     f"(shape={logits_array.shape}, {logits_array.nbytes / 1e6:.1f} MB)")
     else:
         pd.DataFrame(columns=["filename", "start", "end", "primary_label"]
                       ).to_csv(output_path, index=False)

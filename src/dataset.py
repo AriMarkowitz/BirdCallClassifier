@@ -66,11 +66,26 @@ def variable_length_collate_fn(batch):
     for i, w in enumerate(waveforms):
         padded[i, :len(w)] = w
 
-    return {
+    result = {
         "waveform": torch.from_numpy(padded),
         "target": torch.from_numpy(np.stack(targets)),
         "lengths": torch.tensor(lengths, dtype=torch.long),
     }
+
+    # Pass through teacher logits if any sample has them (pseudo-label distillation).
+    # Samples without logits get zeros; a mask indicates which samples have real logits.
+    if any("teacher_logits" in s for s in batch):
+        n_classes = batch[0]["target"].shape[0]
+        logits = np.zeros((len(batch), n_classes), dtype=np.float32)
+        mask = np.zeros(len(batch), dtype=np.float32)
+        for i, s in enumerate(batch):
+            if "teacher_logits" in s:
+                logits[i] = s["teacher_logits"]
+                mask[i] = 1.0
+        result["teacher_logits"] = torch.from_numpy(logits)
+        result["teacher_logits_mask"] = torch.from_numpy(mask)
+
+    return result
 
 
 class TrainAudioDataset(Dataset):
@@ -506,6 +521,112 @@ class SoundscapeDataset(Dataset):
         }
 
 
+class PseudoLabelDataset(Dataset):
+    """Loads pseudo-labeled soundscape segments with teacher logits.
+
+    Unlike SoundscapeDataset which uses hard multi-hot targets, this dataset
+    loads the teacher model's raw logits from a companion .npz file. During
+    training, the student is trained to match these logits via KL divergence,
+    preserving the full distribution of teacher knowledge rather than just
+    the thresholded binary decisions.
+
+    The CSV and .npz must be aligned row-by-row (same order, same count).
+
+    Returns:
+        waveform: np.float32 (T,)
+        target: np.float32 (num_classes,) — soft targets (sigmoid of teacher logits)
+        teacher_logits: np.float32 (num_classes,) — raw pre-sigmoid logits
+    """
+
+    def __init__(self, labels_csv, logits_npz, soundscape_dir, audio_dir,
+                 label_map, sample_rate=32000, min_duration=3.0):
+        self.soundscape_dir = soundscape_dir
+        self.audio_dir = audio_dir
+        self.label_map = label_map
+        self.sample_rate = sample_rate
+        self.min_samples = int(sample_rate * min_duration)
+        self.num_classes = len(label_map)
+
+        df = pd.read_csv(labels_csv)
+
+        # Load teacher logits — aligned row-by-row with the CSV
+        npz = np.load(logits_npz)
+        all_logits = npz["logits"].astype(np.float32)
+        assert len(df) == len(all_logits), (
+            f"CSV has {len(df)} rows but logits has {len(all_logits)} — "
+            f"regenerate pseudo-labels")
+
+        self.entries = []
+        self.teacher_logits = []
+        for row_idx, (_, row) in enumerate(df.iterrows()):
+            filename = row["filename"]
+            start_sec = _time_to_seconds(row["start"])
+            end_sec = _time_to_seconds(row["end"])
+
+            # Determine if this is a soundscape or train_audio file
+            is_train_audio = "/" in str(filename)
+
+            # Parse label_indices for class-balanced sampler compatibility
+            label_strs = str(row["primary_label"]).split(";")
+            label_indices = [label_map[l.strip()] for l in label_strs
+                             if l.strip() in label_map]
+
+            self.entries.append({
+                "filename": filename,
+                "start_sample": int(start_sec * sample_rate),
+                "end_sample": int(end_sec * sample_rate),
+                "is_train_audio": is_train_audio,
+                "label_indices": label_indices,
+            })
+            self.teacher_logits.append(all_logits[row_idx])
+
+        self.teacher_logits = np.stack(self.teacher_logits) if self.teacher_logits else np.zeros((0, self.num_classes), dtype=np.float32)
+        logger.info(f"PseudoLabelDataset: {len(self.entries)} segments with teacher logits")
+
+    def __len__(self):
+        return len(self.entries)
+
+    def __getitem__(self, index):
+        entry = self.entries[index]
+        if entry["is_train_audio"]:
+            filepath = os.path.join(self.audio_dir, entry["filename"])
+        else:
+            filepath = os.path.join(self.soundscape_dir, entry["filename"])
+
+        start = entry["start_sample"]
+        n_frames = entry["end_sample"] - start
+        try:
+            audio, sr = sf.read(filepath, start=start, frames=n_frames, dtype="float32")
+        except Exception:
+            audio, sr = librosa.load(filepath, sr=self.sample_rate, mono=True)
+            s = int(start * self.sample_rate / sr) if sr != self.sample_rate else start
+            audio = audio[s:s + int(n_frames * self.sample_rate / sr)]
+
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        if sr != self.sample_rate:
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=self.sample_rate)
+
+        audio = audio.astype(np.float32)
+
+        if len(audio) < self.min_samples:
+            if len(audio) == 0:
+                audio = np.zeros(self.min_samples, dtype=np.float32)
+            else:
+                repeats = (self.min_samples // len(audio)) + 1
+                audio = np.tile(audio, repeats)[:self.min_samples]
+
+        # Soft target = sigmoid of teacher logits (for supervised loss compatibility)
+        logits = self.teacher_logits[index]
+        soft_target = 1.0 / (1.0 + np.exp(-logits))
+
+        return {
+            "waveform": audio,
+            "target": soft_target,
+            "teacher_logits": logits,
+        }
+
+
 class DistillAudioDataset(Dataset):
     """Loads supplemental audio from distill_audio/ using distill_manifest.csv.
 
@@ -821,43 +942,59 @@ def get_datasets(data_dir, sample_rate=32000,
     sc_val = Subset(soundscape_ds_val, sc_val_indices)
 
     # Add pseudo-labeled segments to training only.
+    # Prefer logit-based loading if .npz exists alongside the CSV.
     pseudo_ds = None
     if pseudo_labels_csv and os.path.isfile(pseudo_labels_csv):
-        pseudo_df = pd.read_csv(pseudo_labels_csv)
-        sc_mask = ~pseudo_df["filename"].str.contains("/", na=False)
-        audio_mask = pseudo_df["filename"].str.contains("/", na=False)
+        logits_npz = pseudo_labels_csv.replace(".csv", ".npz") \
+            if isinstance(pseudo_labels_csv, str) \
+            else str(pseudo_labels_csv).replace(".csv", ".npz")
 
-        pseudo_parts = []
-        if sc_mask.any():
-            sc_pseudo_csv = pseudo_labels_csv.replace(".csv", "_sc.csv") \
-                if isinstance(pseudo_labels_csv, str) \
-                else str(pseudo_labels_csv).replace(".csv", "_sc.csv")
-            pseudo_df[sc_mask].to_csv(sc_pseudo_csv, index=False)
-            sc_pseudo_ds = SoundscapeDataset(
-                sc_pseudo_csv, soundscape_dir, label_map,
+        if os.path.isfile(logits_npz):
+            # Logit-based pseudo-labels (preferred): preserves full teacher distribution
+            pseudo_ds = PseudoLabelDataset(
+                pseudo_labels_csv, logits_npz,
+                soundscape_dir, audio_dir, label_map,
                 sample_rate=sample_rate, min_duration=min_duration,
-                label_smoothing=label_smoothing,
             )
-            pseudo_parts.append(sc_pseudo_ds)
-            logger.info(f"Pseudo-labels (soundscape): {len(sc_pseudo_ds)} segments")
+            logger.info(f"Pseudo-labels (logit-based): {len(pseudo_ds)} segments with teacher logits")
+        else:
+            # Fallback: hard-label pseudo-labels (legacy .csv-only format)
+            logger.warning("No .npz logits found — falling back to hard pseudo-labels")
+            pseudo_df = pd.read_csv(pseudo_labels_csv)
+            sc_mask = ~pseudo_df["filename"].str.contains("/", na=False)
+            audio_mask = pseudo_df["filename"].str.contains("/", na=False)
 
-        if audio_mask.any():
-            audio_pseudo_csv = pseudo_labels_csv.replace(".csv", "_audio.csv") \
-                if isinstance(pseudo_labels_csv, str) \
-                else str(pseudo_labels_csv).replace(".csv", "_audio.csv")
-            pseudo_df[audio_mask].to_csv(audio_pseudo_csv, index=False)
-            audio_pseudo_ds = SoundscapeDataset(
-                audio_pseudo_csv, audio_dir, label_map,
-                sample_rate=sample_rate, min_duration=min_duration,
-                label_smoothing=label_smoothing,
-            )
-            pseudo_parts.append(audio_pseudo_ds)
-            logger.info(f"Pseudo-labels (train_audio secondary): {len(audio_pseudo_ds)} segments")
+            pseudo_parts = []
+            if sc_mask.any():
+                sc_pseudo_csv = pseudo_labels_csv.replace(".csv", "_sc.csv") \
+                    if isinstance(pseudo_labels_csv, str) \
+                    else str(pseudo_labels_csv).replace(".csv", "_sc.csv")
+                pseudo_df[sc_mask].to_csv(sc_pseudo_csv, index=False)
+                sc_pseudo_ds = SoundscapeDataset(
+                    sc_pseudo_csv, soundscape_dir, label_map,
+                    sample_rate=sample_rate, min_duration=min_duration,
+                    label_smoothing=label_smoothing,
+                )
+                pseudo_parts.append(sc_pseudo_ds)
 
-        if pseudo_parts:
-            pseudo_ds = ConcatDataset(pseudo_parts) if len(pseudo_parts) > 1 else pseudo_parts[0]
+            if audio_mask.any():
+                audio_pseudo_csv = pseudo_labels_csv.replace(".csv", "_audio.csv") \
+                    if isinstance(pseudo_labels_csv, str) \
+                    else str(pseudo_labels_csv).replace(".csv", "_audio.csv")
+                pseudo_df[audio_mask].to_csv(audio_pseudo_csv, index=False)
+                audio_pseudo_ds = SoundscapeDataset(
+                    audio_pseudo_csv, audio_dir, label_map,
+                    sample_rate=sample_rate, min_duration=min_duration,
+                    label_smoothing=label_smoothing,
+                )
+                pseudo_parts.append(audio_pseudo_ds)
+
+            if pseudo_parts:
+                pseudo_ds = ConcatDataset(pseudo_parts) if len(pseudo_parts) > 1 else pseudo_parts[0]
+                logger.info(f"Pseudo-labels (hard): {len(pseudo_ds)} segments")
+
+        if pseudo_ds is not None:
             sc_train = ConcatDataset([sc_train_gt, pseudo_ds])
-            logger.info(f"Pseudo-labels total: {len(pseudo_ds)} segments added to training")
         else:
             sc_train = sc_train_gt
     else:

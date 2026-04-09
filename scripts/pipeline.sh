@@ -46,12 +46,28 @@ CKPT="${CKPT:-}"  # path to existing checkpoint; if empty, trains from scratch f
 JOB_ID="${SLURM_JOB_ID:-local_$(date +%Y%m%d_%H%M%S)}"
 MIN_DURATION="${MIN_DURATION:-5.0}"
 MAX_DURATION="${MAX_DURATION:-5.0}"
+DISTILL_MANIFEST="${DISTILL_MANIFEST:-$PROJECT_DIR/data/distill_manifest.csv}"
+HARD_NEGATIVES="${HARD_NEGATIVES:-1}"
+MAX_PER_SPECIES="${MAX_PER_SPECIES:-500}"
+PSEUDO_DISTILL_WEIGHT="${PSEUDO_DISTILL_WEIGHT:-1.0}"
+RETRAIN_EPOCHS="${RETRAIN_EPOCHS:-20}"
+RETRAIN_LR="${RETRAIN_LR:-1e-5}"
 
 VALID_REGIONS="$PROJECT_DIR/data/valid_regions.json"
 PSEUDO_CSV="$PROJECT_DIR/data/pseudo_labels.csv"
 
+HARD_NEG_ARG="--hard_negatives"
+if [ "$HARD_NEGATIVES" = "0" ]; then
+    HARD_NEG_ARG="--no_hard_negatives"
+fi
+
+DISTILL_MANIFEST_ARG=""
+if [ -n "$DISTILL_MANIFEST" ] && [ -f "$DISTILL_MANIFEST" ]; then
+    DISTILL_MANIFEST_ARG="--distill_manifest $DISTILL_MANIFEST"
+fi
+
 echo "=== Pipeline: pseudo-label → retrain ==="
-echo "Job: $JOB_ID, Fold: $FOLD, Seed: $SEED, Threshold: $THRESHOLD"
+echo "Job: $JOB_ID, Fold: $FOLD, Seed: $SEED, Threshold: $THRESHOLD, MaxPerSpecies: $MAX_PER_SPECIES"
 echo "Checkpoint: ${CKPT:-'(will train from scratch first)'}"
 echo "---"
 
@@ -85,13 +101,15 @@ if [ -z "$CKPT" ]; then
         --min_duration "$MIN_DURATION" \
         --max_duration "$MAX_DURATION" \
         --full_files \
-        --distill \
+        --no_distill \
         --balance_alpha 0.5 \
         --use_wandb \
         --wandb_project birdclef-2026 \
         --run_name "enet-${RUN_ID_R1}" \
         --run_id "$RUN_ID_R1" \
-        --valid_regions "$VALID_REGIONS"
+        --valid_regions "$VALID_REGIONS" \
+        $DISTILL_MANIFEST_ARG \
+        $HARD_NEG_ARG
 
     # Find best checkpoint from round 1
     CKPT=$(ls -t "$CKPT_DIR/$RUN_ID_R1"/birdclef-birdset-*.ckpt 2>/dev/null | head -1)
@@ -114,6 +132,7 @@ python scripts/pseudo_label.py \
     --data-dir "$PROJECT_DIR/data" \
     --output "$PSEUDO_CSV" \
     --threshold "$THRESHOLD" \
+    --max-per-species "$MAX_PER_SPECIES" \
     --batch-size 64 \
     --use_wandb \
     --wandb_project birdclef-2026 \
@@ -127,17 +146,20 @@ if [ "$N_PSEUDO" -eq 0 ]; then
     exit 0
 fi
 
-# ── Step 3: Retrain with pseudo-labels ──
+# ── Step 3: Retrain with pseudo-labels (warm-started from round 1) ──
 RUN_ID_R2="${JOB_ID}_fold${FOLD}_r2"
 echo ""
 echo "=== Step 3: Retraining with pseudo-labels (run=$RUN_ID_R2) ==="
+echo "  Warm-starting from: $CKPT"
+echo "  Retrain LR: $RETRAIN_LR, Epochs: $RETRAIN_EPOCHS"
+echo "  Pseudo-distill weight: $PSEUDO_DISTILL_WEIGHT"
 
 python src/train.py \
     --data_dir "$PROJECT_DIR/data" \
     --batch_size 16 \
     --num_workers 8 \
-    --max_epochs 40 \
-    --lr 5e-5 \
+    --max_epochs "$RETRAIN_EPOCHS" \
+    --lr "$RETRAIN_LR" \
     --precision bf16 \
     --save_dir "$CKPT_DIR" \
     --seed "$SEED" \
@@ -148,14 +170,18 @@ python src/train.py \
     --min_duration "$MIN_DURATION" \
     --max_duration "$MAX_DURATION" \
     --full_files \
-    --distill \
+    --no_distill \
     --balance_alpha 0.5 \
     --use_wandb \
     --wandb_project birdclef-2026 \
     --run_name "enet-${RUN_ID_R2}" \
     --run_id "$RUN_ID_R2" \
     --valid_regions "$VALID_REGIONS" \
-    --pseudo_labels "$PSEUDO_CSV"
+    --pseudo_labels "$PSEUDO_CSV" \
+    --pseudo_distill_weight "$PSEUDO_DISTILL_WEIGHT" \
+    --warmstart "$CKPT" \
+    $DISTILL_MANIFEST_ARG \
+    $HARD_NEG_ARG
 
 echo ""
 echo "=== Pipeline complete ==="

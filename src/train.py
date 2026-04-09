@@ -65,6 +65,7 @@ class BirdCLEFWrapper(pl.LightningModule):
         distill_temperature=2.0,
         teacher_model=None,
         idx_to_label=None,
+        pseudo_distill_weight=1.0,
     ):
         super().__init__()
         self.model = model
@@ -76,6 +77,7 @@ class BirdCLEFWrapper(pl.LightningModule):
         self.distill_temperature = distill_temperature
         self.teacher_model = teacher_model
         self.idx_to_label = idx_to_label or {}
+        self.pseudo_distill_weight = pseudo_distill_weight
 
         if loss_type == "focal":
             self.loss_fn = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
@@ -127,6 +129,42 @@ class BirdCLEFWrapper(pl.LightningModule):
                 student_log_prob, teacher_prob, reduction="batchmean",
             )
 
+    def _pseudo_distill_loss(self, student_logits, teacher_logits, mask):
+        """Per-sample binary KL divergence between student and teacher logits.
+
+        For multi-label classification, we treat each class as an independent
+        Bernoulli and compute KL(teacher || student) per class, then average.
+        This is more appropriate than softmax KL since multiple species can
+        be present simultaneously.
+
+        Only applied to samples where mask=1 (i.e., pseudo-labeled samples).
+        """
+        with torch.amp.autocast("cuda", enabled=False):
+            s = torch.nan_to_num(student_logits.float(), nan=0.0, posinf=20.0, neginf=-20.0)
+            t = torch.nan_to_num(teacher_logits.float(), nan=0.0, posinf=20.0, neginf=-20.0)
+            mask = mask.float()
+
+            if mask.sum() == 0:
+                return torch.tensor(0.0, device=student_logits.device)
+
+            # Bernoulli KL: KL(p_t || p_s) for each class independently
+            # p_t = sigmoid(t), p_s = sigmoid(s)
+            # KL = p_t * log(p_t/p_s) + (1-p_t) * log((1-p_t)/(1-p_s))
+            # = p_t * (log_sigmoid(t) - log_sigmoid(s))
+            #   + (1-p_t) * (log_sigmoid(-t) - log_sigmoid(-s))
+            log_s_pos = torch.nn.functional.logsigmoid(s)
+            log_s_neg = torch.nn.functional.logsigmoid(-s)
+            log_t_pos = torch.nn.functional.logsigmoid(t)
+            log_t_neg = torch.nn.functional.logsigmoid(-t)
+
+            p_t = torch.sigmoid(t)
+            kl = p_t * (log_t_pos - log_s_pos) + (1.0 - p_t) * (log_t_neg - log_s_neg)
+            # kl shape: (B, C), all non-negative
+
+            # Mean over classes, then masked mean over batch
+            per_sample = kl.mean(dim=-1)  # (B,)
+            return (per_sample * mask).sum() / mask.sum()
+
     def _sumix(self, waveform, target):
         """Additive waveform mixing with soft target max-merge."""
         if self.mixup_alpha <= 0:
@@ -161,6 +199,7 @@ class BirdCLEFWrapper(pl.LightningModule):
 
         total_loss = supervised_loss
         distill_loss = torch.tensor(0.0, device=waveform.device)
+        pseudo_distill_loss = torch.tensor(0.0, device=waveform.device)
 
         if distill_active:
             # Reuse the same (clean) mel chunk the student used (no extra STFT)
@@ -177,11 +216,28 @@ class BirdCLEFWrapper(pl.LightningModule):
                 distill_loss = torch.tensor(0.0, device=waveform.device)
                 total_loss = supervised_loss
 
+        # Pseudo-label distillation: match teacher logits on pseudo-labeled samples
+        if "teacher_logits" in batch and self.pseudo_distill_weight > 0:
+            teacher_logits_pl = batch["teacher_logits"]
+            mask = batch["teacher_logits_mask"]
+            if mask.sum() > 0:
+                # Student logits on target classes (same shape as teacher logits)
+                student_logits_target = output_dict["logits"]
+                pseudo_distill_loss = self._pseudo_distill_loss(
+                    student_logits_target, teacher_logits_pl, mask)
+                if torch.isfinite(pseudo_distill_loss):
+                    total_loss = total_loss + self.pseudo_distill_weight * pseudo_distill_loss
+                else:
+                    logger.warning(f"Step {self.global_step}: pseudo_distill_loss is NaN/Inf, skipping")
+                    pseudo_distill_loss = torch.tensor(0.0, device=waveform.device)
+
         self.log("train_loss", total_loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log("train_supervised_loss", supervised_loss, on_step=True, on_epoch=True)
         if self.teacher_model is not None and self.distill_weight > 0:
             self.log("train_distill_loss", distill_loss, on_step=True, on_epoch=True)
             self.log("distill_weight_current", self._current_distill_weight(), on_step=False, on_epoch=True)
+        if "teacher_logits" in batch:
+            self.log("train_pseudo_distill_loss", pseudo_distill_loss, on_step=True, on_epoch=True)
 
         if batch_idx % 50 == 0:
             logger.info(
@@ -259,6 +315,23 @@ class BirdCLEFWrapper(pl.LightningModule):
             eps=1e-8,
             weight_decay=0.05,
         )
+
+        # Restore optimizer state from warm-start checkpoint if available.
+        # This preserves AdamW momentum/second-moment estimates so the model
+        # doesn't "jolt" when retraining starts.
+        if hasattr(self, "_warmstart_optimizer_states") and self._warmstart_optimizer_states:
+            try:
+                opt_state = self._warmstart_optimizer_states[0]
+                optimizer.load_state_dict(opt_state)
+                # Override LR to use the new config value (not the checkpointed one)
+                for pg in optimizer.param_groups:
+                    pg["lr"] = self.learning_rate
+                logger.info(f"  Optimizer state restored from warm-start checkpoint "
+                            f"(LR overridden to {self.learning_rate})")
+            except Exception as e:
+                logger.warning(f"  Could not restore optimizer state: {e} — starting fresh")
+            del self._warmstart_optimizer_states
+
         # Cosine annealing with linear warmup (5% of training)
         warmup_epochs = max(1, self.max_epochs // 20)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -309,6 +382,9 @@ def main():
     parser.add_argument("--save_dir", type=str, default=os.path.join(PROJ_ROOT, "checkpoints"))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume_from", type=str, default=None)
+    parser.add_argument("--warmstart", type=str, default=None,
+                        help="Load model weights (+ optimizer state) from a checkpoint "
+                             "without resuming epoch/scheduler. Used for pseudo-label retraining.")
 
     parser.add_argument("--label_smoothing", type=float, default=0.05)
     parser.add_argument("--loss", type=str, default="focal", choices=["bce", "focal"])
@@ -337,6 +413,8 @@ def main():
     parser.add_argument("--preload", action="store_true")
     parser.add_argument("--valid_regions", type=str, default=None)
     parser.add_argument("--pseudo_labels", type=str, default=None)
+    parser.add_argument("--pseudo_distill_weight", type=float, default=1.0,
+                        help="Weight for pseudo-label logit distillation loss (KL divergence)")
     parser.add_argument("--balance_alpha", type=float, default=0.5)
 
     parser.add_argument("--distill_manifest", type=str, default=None,
@@ -434,7 +512,30 @@ def main():
         distill_temperature=args.distill_temperature,
         teacher_model=teacher,
         idx_to_label=idx_to_label,
+        pseudo_distill_weight=args.pseudo_distill_weight,
     )
+
+    # --- Warm-start: load model weights + optimizer state from a prior checkpoint ---
+    if args.warmstart:
+        logger.info(f"Warm-starting from: {args.warmstart}")
+        ckpt = torch.load(args.warmstart, map_location="cpu", weights_only=False)
+        state_dict = ckpt.get("state_dict", ckpt)
+
+        # Load model weights (handles Lightning "model." prefix)
+        missing, unexpected = wrapper.load_state_dict(state_dict, strict=False)
+        # Filter out optimizer/scheduler keys from unexpected — those are expected
+        unexpected_model = [k for k in unexpected if not k.startswith("lr_schedulers")
+                           and not k.startswith("optimizer_states")]
+        if missing:
+            logger.warning(f"  Warm-start missing keys: {missing}")
+        if unexpected_model:
+            logger.warning(f"  Warm-start unexpected keys: {unexpected_model}")
+        logger.info(f"  Model weights loaded successfully")
+
+        # Restore optimizer state if available — gives momentum/adaptive LR continuity
+        if "optimizer_states" in ckpt:
+            wrapper._warmstart_optimizer_states = ckpt["optimizer_states"]
+            logger.info(f"  Optimizer state cached for post-setup loading")
 
     run_id = args.run_id or f"seed{args.seed}"
     run_save_dir = os.path.join(args.save_dir, run_id)
@@ -477,6 +578,8 @@ def main():
                 "distill_weight": args.distill_weight,
                 "distill_temperature": args.distill_temperature,
                 "pseudo_labels": args.pseudo_labels,
+                "pseudo_distill_weight": args.pseudo_distill_weight,
+                "warmstart": args.warmstart,
                 "balance_alpha": args.balance_alpha,
                 "min_duration": args.min_duration,
                 "max_duration": args.max_duration,
