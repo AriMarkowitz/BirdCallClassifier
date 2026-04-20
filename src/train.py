@@ -316,23 +316,19 @@ class BirdCLEFWrapper(pl.LightningModule):
             weight_decay=0.05,
         )
 
-        # Restore optimizer state from warm-start checkpoint if available.
-        # This preserves AdamW momentum/second-moment estimates so the model
-        # doesn't "jolt" when retraining starts.
-        if hasattr(self, "_warmstart_optimizer_states") and self._warmstart_optimizer_states:
-            try:
-                opt_state = self._warmstart_optimizer_states[0]
-                optimizer.load_state_dict(opt_state)
-                # Override LR to use the new config value (not the checkpointed one)
-                for pg in optimizer.param_groups:
-                    pg["lr"] = self.learning_rate
-                logger.info(f"  Optimizer state restored from warm-start checkpoint "
-                            f"(LR overridden to {self.learning_rate})")
-            except Exception as e:
-                logger.warning(f"  Could not restore optimizer state: {e} — starting fresh")
-            del self._warmstart_optimizer_states
+        is_warmstart = hasattr(self, "_warmstart") and self._warmstart
 
-        # Cosine annealing with linear warmup (5% of training)
+        if is_warmstart:
+            # Warm-start: fresh optimizer (don't restore stale momentum),
+            # cosine decay only — no warmup since weights are already good.
+            logger.info(f"  Warm-start LR schedule: cosine decay from {self.learning_rate} "
+                        f"over {self.max_epochs} epochs (no warmup)")
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=self.max_epochs, eta_min=1e-7,
+            )
+            return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
+
+        # Normal training: cosine annealing with linear warmup (5% of training)
         warmup_epochs = max(1, self.max_epochs // 20)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=self.max_epochs - warmup_epochs, eta_min=1e-7,
@@ -515,7 +511,7 @@ def main():
         pseudo_distill_weight=args.pseudo_distill_weight,
     )
 
-    # --- Warm-start: load model weights + optimizer state from a prior checkpoint ---
+    # --- Warm-start: load model weights from a prior checkpoint ---
     if args.warmstart:
         logger.info(f"Warm-starting from: {args.warmstart}")
         ckpt = torch.load(args.warmstart, map_location="cpu", weights_only=False)
@@ -523,7 +519,6 @@ def main():
 
         # Load model weights (handles Lightning "model." prefix)
         missing, unexpected = wrapper.load_state_dict(state_dict, strict=False)
-        # Filter out optimizer/scheduler keys from unexpected — those are expected
         unexpected_model = [k for k in unexpected if not k.startswith("lr_schedulers")
                            and not k.startswith("optimizer_states")]
         if missing:
@@ -532,10 +527,8 @@ def main():
             logger.warning(f"  Warm-start unexpected keys: {unexpected_model}")
         logger.info(f"  Model weights loaded successfully")
 
-        # Restore optimizer state if available — gives momentum/adaptive LR continuity
-        if "optimizer_states" in ckpt:
-            wrapper._warmstart_optimizer_states = ckpt["optimizer_states"]
-            logger.info(f"  Optimizer state cached for post-setup loading")
+        # Flag for configure_optimizers to use warm-start LR schedule
+        wrapper._warmstart = True
 
     run_id = args.run_id or f"seed{args.seed}"
     run_save_dir = os.path.join(args.save_dir, run_id)

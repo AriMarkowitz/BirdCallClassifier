@@ -49,9 +49,10 @@ MAX_DURATION="${MAX_DURATION:-5.0}"
 DISTILL_MANIFEST="${DISTILL_MANIFEST:-$PROJECT_DIR/data/distill_manifest.csv}"
 HARD_NEGATIVES="${HARD_NEGATIVES:-1}"
 MAX_PER_SPECIES="${MAX_PER_SPECIES:-500}"
+SKIP_PSEUDO="${SKIP_PSEUDO:-0}"  # set to 1 to reuse existing pseudo_labels.csv/.npz
 PSEUDO_DISTILL_WEIGHT="${PSEUDO_DISTILL_WEIGHT:-1.0}"
 RETRAIN_EPOCHS="${RETRAIN_EPOCHS:-20}"
-RETRAIN_LR="${RETRAIN_LR:-1e-5}"
+RETRAIN_LR="${RETRAIN_LR:-1e-4}"
 
 VALID_REGIONS="$PROJECT_DIR/data/valid_regions.json"
 PSEUDO_CSV="$PROJECT_DIR/data/pseudo_labels.csv"
@@ -124,22 +125,30 @@ else
 fi
 
 # ── Step 2: Pseudo-label ──
-echo ""
-echo "=== Step 2: Pseudo-labeling (threshold=$THRESHOLD) ==="
+if [ "$SKIP_PSEUDO" = "1" ] && [ -f "$PSEUDO_CSV" ] && [ -f "${PSEUDO_CSV%.csv}.npz" ]; then
+    echo ""
+    echo "=== Step 2: Skipping pseudo-labeling (SKIP_PSEUDO=1, reusing $PSEUDO_CSV) ==="
+    N_PSEUDO=$(tail -n +2 "$PSEUDO_CSV" 2>/dev/null | wc -l)
+    echo "Existing pseudo-labeled segments: $N_PSEUDO"
+else
+    echo ""
+    echo "=== Step 2: Pseudo-labeling (threshold=$THRESHOLD) ==="
 
-python scripts/pseudo_label.py \
-    --checkpoint "$CKPT" \
-    --data-dir "$PROJECT_DIR/data" \
-    --output "$PSEUDO_CSV" \
-    --threshold "$THRESHOLD" \
-    --max-per-species "$MAX_PER_SPECIES" \
-    --batch-size 64 \
-    --use_wandb \
-    --wandb_project birdclef-2026 \
-    --run_name "pseudo-label-${JOB_ID}_fold${FOLD}"
+    python scripts/pseudo_label.py \
+        --checkpoint "$CKPT" \
+        --data-dir "$PROJECT_DIR/data" \
+        --output "$PSEUDO_CSV" \
+        --threshold "$THRESHOLD" \
+        --max-per-species "$MAX_PER_SPECIES" \
+        --match-train-distribution \
+        --batch-size 64 \
+        --use_wandb \
+        --wandb_project birdclef-2026 \
+        --run_name "pseudo-label-${JOB_ID}_fold${FOLD}"
 
-N_PSEUDO=$(tail -n +2 "$PSEUDO_CSV" 2>/dev/null | wc -l)
-echo "Pseudo-labeled segments: $N_PSEUDO"
+    N_PSEUDO=$(tail -n +2 "$PSEUDO_CSV" 2>/dev/null | wc -l)
+    echo "Pseudo-labeled segments: $N_PSEUDO"
+fi
 
 if [ "$N_PSEUDO" -eq 0 ]; then
     echo "WARNING: No pseudo-labels generated. Skipping retrain."

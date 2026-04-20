@@ -160,6 +160,10 @@ def main():
     parser.add_argument("--max-per-species", type=int, default=0,
                         help="Max pseudo-labeled segments per species (0=unlimited). "
                              "Keeps highest-confidence segments when capping.")
+    parser.add_argument("--match-train-distribution", action="store_true",
+                        help="Cap each species proportional to its frequency in the "
+                             "training data, preventing soundscape-dominant species "
+                             "from distorting the class distribution.")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--use_wandb", action="store_true")
@@ -305,29 +309,65 @@ def main():
     rows = rows_soundscape + rows_train_audio
 
     # --- Per-species cap (keep highest-confidence segments) ---
-    if args.max_per_species > 0 and rows:
-        logger.info(f"Applying per-species cap: max {args.max_per_species} segments per species")
-        pre_cap = len(rows)
-
-        # Build per-species list of (row_idx, max_conf_for_species)
-        species_rows = defaultdict(list)
+    # Build per-species list of (row_idx, confidence) — used by both cap modes
+    species_rows = defaultdict(list)
+    if rows:
         for i, row in enumerate(rows):
             labels = row["primary_label"].split(";")
-            # Use the logits to get the actual confidence for each species
             logit_vec = logits_list[i].astype(np.float32)
             for sp in labels:
                 sp_idx = label_map.get(sp)
                 conf = float(1.0 / (1.0 + np.exp(-logit_vec[sp_idx]))) if sp_idx is not None else 0.0
                 species_rows[sp].append((i, conf))
 
-        # For each over-represented species, find which indices to keep
+    # Determine per-species caps
+    if args.match_train_distribution and rows:
+        # Cap each species proportional to its training frequency.
+        # Species with N training samples get cap = N * pseudo_ratio.
+        # This prevents soundscape-dominant species from distorting the distribution.
+        train_csv = data_dir / "train.csv"
+        train_df = pd.read_csv(train_csv)
+        train_counts = Counter(str(row["primary_label"]) for _, row in train_df.iterrows())
+
+        # Target: pseudo-labels add ~10% of training data, distributed proportionally
+        total_train = len(train_df)
+        target_pseudo_total = int(total_train * 0.1)  # ~3500
+
+        # Allocate proportionally, minimum 5 per detected species
+        species_caps = {}
+        for sp in species_rows:
+            train_n = train_counts.get(sp, 0)
+            if train_n > 0:
+                cap = max(5, int(target_pseudo_total * train_n / total_train))
+            else:
+                # Species not in training data — give a small quota
+                cap = 5
+            species_caps[sp] = min(cap, len(species_rows[sp]))
+
+        logger.info(f"Matching train distribution: target ~{target_pseudo_total} total pseudo-labels")
+        logger.info(f"  Per-species caps: min={min(species_caps.values())}, "
+                     f"max={max(species_caps.values())}, "
+                     f"median={sorted(species_caps.values())[len(species_caps)//2]}")
+
+    elif args.max_per_species > 0 and rows:
+        species_caps = {sp: args.max_per_species for sp in species_rows}
+        logger.info(f"Applying flat per-species cap: max {args.max_per_species}")
+
+    else:
+        species_caps = None
+
+    if species_caps and rows:
+        pre_cap = len(rows)
+
+        # For each species, keep top-K by confidence
         species_top_k = {}
         for sp, entries in species_rows.items():
-            if len(entries) <= args.max_per_species:
+            cap = species_caps.get(sp, len(entries))
+            if len(entries) <= cap:
                 species_top_k[sp] = {e[0] for e in entries}
             else:
                 entries.sort(key=lambda x: -x[1])
-                species_top_k[sp] = {e[0] for e in entries[:args.max_per_species]}
+                species_top_k[sp] = {e[0] for e in entries[:cap]}
 
         # A row is kept if at least one of its species still wants it
         kept_indices = []

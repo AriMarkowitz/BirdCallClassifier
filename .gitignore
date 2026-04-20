@@ -9,3 +9,4 @@ __pycache__/
 wandb/*
 *.out
 nmf_analysis/output/*
+.claude/*
