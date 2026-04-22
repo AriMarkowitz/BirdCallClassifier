@@ -51,6 +51,8 @@ HARD_NEGATIVES="${HARD_NEGATIVES:-1}"
 MAX_PER_SPECIES="${MAX_PER_SPECIES:-500}"
 SKIP_PSEUDO="${SKIP_PSEUDO:-0}"  # set to 1 to reuse existing pseudo_labels.csv/.npz
 PSEUDO_DISTILL_WEIGHT="${PSEUDO_DISTILL_WEIGHT:-1.0}"
+PSEUDO_POWER_T="${PSEUDO_POWER_T:-2.0}"  # T>1 sharpens pseudo soft labels; suppresses mid-range noise
+PSEUDO_MIXUP_ALPHA="${PSEUDO_MIXUP_ALPHA:-0.4}"  # cross-domain MixUp pseudo↔labeled (Babych'25)
 RETRAIN_EPOCHS="${RETRAIN_EPOCHS:-20}"
 RETRAIN_LR="${RETRAIN_LR:-1e-4}"
 
@@ -162,6 +164,7 @@ echo "=== Step 3: Retraining with pseudo-labels (run=$RUN_ID_R2) ==="
 echo "  Warm-starting from: $CKPT"
 echo "  Retrain LR: $RETRAIN_LR, Epochs: $RETRAIN_EPOCHS"
 echo "  Pseudo-distill weight: $PSEUDO_DISTILL_WEIGHT"
+echo "  Pseudo power-T: $PSEUDO_POWER_T, mixup α: $PSEUDO_MIXUP_ALPHA"
 
 python src/train.py \
     --data_dir "$PROJECT_DIR/data" \
@@ -188,6 +191,8 @@ python src/train.py \
     --valid_regions "$VALID_REGIONS" \
     --pseudo_labels "$PSEUDO_CSV" \
     --pseudo_distill_weight "$PSEUDO_DISTILL_WEIGHT" \
+    --pseudo_power_t "$PSEUDO_POWER_T" \
+    --pseudo_mixup_alpha "$PSEUDO_MIXUP_ALPHA" \
     --warmstart "$CKPT" \
     $DISTILL_MANIFEST_ARG \
     $HARD_NEG_ARG

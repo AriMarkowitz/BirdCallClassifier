@@ -540,13 +540,15 @@ class PseudoLabelDataset(Dataset):
     """
 
     def __init__(self, labels_csv, logits_npz, soundscape_dir, audio_dir,
-                 label_map, sample_rate=32000, min_duration=3.0):
+                 label_map, sample_rate=32000, min_duration=3.0,
+                 power_t=1.0):
         self.soundscape_dir = soundscape_dir
         self.audio_dir = audio_dir
         self.label_map = label_map
         self.sample_rate = sample_rate
         self.min_samples = int(sample_rate * min_duration)
         self.num_classes = len(label_map)
+        self.power_t = float(power_t)
 
         df = pd.read_csv(labels_csv)
 
@@ -582,7 +584,17 @@ class PseudoLabelDataset(Dataset):
             self.teacher_logits.append(all_logits[row_idx])
 
         self.teacher_logits = np.stack(self.teacher_logits) if self.teacher_logits else np.zeros((0, self.num_classes), dtype=np.float32)
-        logger.info(f"PseudoLabelDataset: {len(self.entries)} segments with teacher logits")
+
+        # Pre-compute denoised soft-target sum per segment for weighted sampling
+        # (1st-place idea: chunks with higher Σ p^T are richer / more confident)
+        if len(self.teacher_logits) > 0:
+            sigmoid_p = 1.0 / (1.0 + np.exp(-self.teacher_logits))
+            self.soft_label_sum = (sigmoid_p ** self.power_t).sum(axis=1)
+        else:
+            self.soft_label_sum = np.zeros(0, dtype=np.float32)
+
+        logger.info(f"PseudoLabelDataset: {len(self.entries)} segments with teacher logits "
+                    f"(power_t={self.power_t})")
 
     def __len__(self):
         return len(self.entries)
@@ -617,14 +629,25 @@ class PseudoLabelDataset(Dataset):
                 repeats = (self.min_samples // len(audio)) + 1
                 audio = np.tile(audio, repeats)[:self.min_samples]
 
-        # Soft target = sigmoid of teacher logits (for supervised loss compatibility)
+        # Soft target = sigmoid(logits)^T (power transform sharpens confident
+        # predictions and squashes mid-range noise — Babych BirdCLEF'25 1st-place).
+        # Pass T into KL via temperature-scaled effective logits so distill loss
+        # matches the supervised target.
         logits = self.teacher_logits[index]
-        soft_target = 1.0 / (1.0 + np.exp(-logits))
+        sigmoid_p = 1.0 / (1.0 + np.exp(-logits))
+        soft_target = sigmoid_p ** self.power_t
+        if self.power_t != 1.0:
+            # Effective logits whose sigmoid equals the power-transformed target.
+            eps = 1e-7
+            p_clamped = np.clip(soft_target, eps, 1.0 - eps)
+            effective_logits = np.log(p_clamped / (1.0 - p_clamped)).astype(np.float32)
+        else:
+            effective_logits = logits
 
         return {
             "waveform": audio,
-            "target": soft_target,
-            "teacher_logits": logits,
+            "target": soft_target.astype(np.float32),
+            "teacher_logits": effective_logits,
         }
 
 
@@ -765,6 +788,7 @@ def get_datasets(data_dir, sample_rate=32000,
                  seed=42, label_smoothing=0.0, n_folds=5, fold=0,
                  multi_mix=True, mix_prob=0.7, preload=False,
                  valid_regions_path=None, pseudo_labels_csv=None,
+                 pseudo_power_t=1.0,
                  full_files=True,
                  distill_manifest=None, hard_negatives=True,
                  bg_mix_prob=0.0, bg_snr_range=(3.0, 15.0)):
@@ -956,6 +980,7 @@ def get_datasets(data_dir, sample_rate=32000,
                 pseudo_labels_csv, logits_npz,
                 soundscape_dir, audio_dir, label_map,
                 sample_rate=sample_rate, min_duration=min_duration,
+                power_t=pseudo_power_t,
             )
             logger.info(f"Pseudo-labels (logit-based): {len(pseudo_ds)} segments with teacher logits")
         else:
@@ -1175,9 +1200,29 @@ def _build_class_balanced_sampler(split_info, num_classes, n_train_audio, n_sc_t
         w = max(class_weights[li] for li in entry["label_indices"])
         sample_weights[n_train_audio + i] = w
 
+    # For pseudo segments, multiply class-balanced weight by Σ soft-labels
+    # (Babych BirdCLEF'25: chunks with higher Σ p^T are richer / more confident).
+    pseudo_soft_sums = None
+    if pseudo_ds is not None and hasattr(pseudo_ds, "soft_label_sum"):
+        pseudo_soft_sums = pseudo_ds.soft_label_sum
+    elif pseudo_ds is not None and hasattr(pseudo_ds, "datasets"):
+        sums = []
+        for sub in pseudo_ds.datasets:
+            if hasattr(sub, "soft_label_sum"):
+                sums.append(sub.soft_label_sum)
+        if sums:
+            pseudo_soft_sums = np.concatenate(sums)
+
+    if pseudo_soft_sums is not None and len(pseudo_soft_sums) == len(pseudo_entries):
+        # Normalize so the mean weighting effect is 1.0 (preserves overall pseudo budget)
+        mean_sum = float(pseudo_soft_sums.mean()) if pseudo_soft_sums.size else 1.0
+        soft_factor = pseudo_soft_sums / max(mean_sum, 1e-6)
+    else:
+        soft_factor = np.ones(len(pseudo_entries), dtype=np.float64)
+
     for i, entry in enumerate(pseudo_entries):
         w = max(class_weights[li] for li in entry["label_indices"])
-        sample_weights[n_train_audio + n_sc_gt + i] = w
+        sample_weights[n_train_audio + n_sc_gt + i] = w * soft_factor[i]
 
     if distill_ds:
         offset = n_train_audio + n_sc_train
@@ -1207,7 +1252,8 @@ def get_dataloaders(data_dir, batch_size=32, num_workers=4, sample_rate=32000,
                     label_smoothing=0.0,
                     n_folds=5, fold=0, multi_mix=True, mix_prob=0.7,
                     preload=False, valid_regions_path=None,
-                    pseudo_labels_csv=None, balance_alpha=0.5,
+                    pseudo_labels_csv=None, pseudo_power_t=1.0,
+                    balance_alpha=0.5,
                     full_files=True,
                     distill_manifest=None, hard_negatives=True,
                     bg_mix_prob=0.0, bg_snr_range=(3.0, 15.0)):
@@ -1224,6 +1270,7 @@ def get_dataloaders(data_dir, batch_size=32, num_workers=4, sample_rate=32000,
         n_folds=n_folds, fold=fold, multi_mix=multi_mix, mix_prob=mix_prob,
         preload=preload, valid_regions_path=valid_regions_path,
         pseudo_labels_csv=pseudo_labels_csv,
+        pseudo_power_t=pseudo_power_t,
         full_files=full_files,
         distill_manifest=distill_manifest, hard_negatives=hard_negatives,
         bg_mix_prob=bg_mix_prob, bg_snr_range=bg_snr_range,

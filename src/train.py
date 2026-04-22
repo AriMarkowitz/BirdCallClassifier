@@ -66,6 +66,7 @@ class BirdCLEFWrapper(pl.LightningModule):
         teacher_model=None,
         idx_to_label=None,
         pseudo_distill_weight=1.0,
+        pseudo_mixup_alpha=0.0,
     ):
         super().__init__()
         self.model = model
@@ -78,6 +79,7 @@ class BirdCLEFWrapper(pl.LightningModule):
         self.teacher_model = teacher_model
         self.idx_to_label = idx_to_label or {}
         self.pseudo_distill_weight = pseudo_distill_weight
+        self.pseudo_mixup_alpha = pseudo_mixup_alpha
 
         if loss_type == "focal":
             self.loss_fn = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
@@ -180,10 +182,75 @@ class BirdCLEFWrapper(pl.LightningModule):
         target_mixed = torch.maximum(target, (1.0 - lam) * target[perm])
         return waveform_mixed, target_mixed
 
+    def _cross_domain_mixup(self, waveform, target, teacher_logits, teacher_mask):
+        """MixUp between pseudo-labeled soundscape chunks and labeled focal samples.
+
+        For each pseudo sample (mask=1), find a labeled partner (mask=0) and mix.
+        Bridges the focal↔soundscape domain gap directly in input space
+        (Babych BirdCLEF'25 1st-place self-training loop).
+
+        After mixing:
+          - waveform = λ·pseudo + (1-λ)·labeled
+          - target   = λ·pseudo_soft + (1-λ)·labeled_hard  (linear interp)
+          - teacher_mask is scaled by λ so the KL loss only counts the
+            pseudo fraction of each mixed sample.
+        """
+        if self.pseudo_mixup_alpha <= 0 or teacher_mask.sum() == 0:
+            return waveform, target, teacher_logits, teacher_mask
+
+        device = waveform.device
+        is_pseudo = teacher_mask > 0.5
+        is_labeled = ~is_pseudo
+        if is_labeled.sum() == 0:
+            return waveform, target, teacher_logits, teacher_mask
+
+        labeled_indices = torch.nonzero(is_labeled, as_tuple=False).squeeze(-1)
+        pseudo_indices = torch.nonzero(is_pseudo, as_tuple=False).squeeze(-1)
+
+        # Sample λ per pseudo sample. Skew toward higher λ so pseudo content
+        # dominates the mix (we still want the teacher signal to drive learning).
+        lam_np = np.random.beta(self.pseudo_mixup_alpha, self.pseudo_mixup_alpha,
+                                size=pseudo_indices.numel())
+        lam_np = np.maximum(lam_np, 1.0 - lam_np)
+        lam = torch.from_numpy(lam_np).float().to(device)
+
+        # Random labeled partner for each pseudo sample (with replacement).
+        partner_pos = torch.randint(0, labeled_indices.numel(),
+                                    (pseudo_indices.numel(),), device=device)
+        partners = labeled_indices[partner_pos]
+
+        # Mix in waveform and target space.
+        lam_w = lam.view(-1, 1)
+        lam_t = lam.view(-1, 1)
+        new_wave = waveform.clone()
+        new_target = target.clone()
+        new_wave[pseudo_indices] = (
+            lam_w * waveform[pseudo_indices]
+            + (1.0 - lam_w) * waveform[partners]
+        )
+        new_target[pseudo_indices] = (
+            lam_t * target[pseudo_indices]
+            + (1.0 - lam_t) * target[partners]
+        )
+
+        # Down-weight the teacher KL contribution by λ for mixed samples.
+        new_mask = teacher_mask.clone()
+        new_mask[pseudo_indices] = lam
+        return new_wave, new_target, teacher_logits, new_mask
+
     def training_step(self, batch, batch_idx):
         waveform = batch["waveform"]
         target = batch["target"]
         distill_active = self.teacher_model is not None and self.distill_weight > 0
+
+        # Cross-domain MixUp first (operates on full batch incl. pseudo).
+        teacher_logits_pl = batch.get("teacher_logits")
+        teacher_mask = batch.get("teacher_logits_mask")
+        if (self.training and self.pseudo_mixup_alpha > 0
+                and teacher_logits_pl is not None and teacher_mask is not None):
+            waveform, target, teacher_logits_pl, teacher_mask = self._cross_domain_mixup(
+                waveform, target, teacher_logits_pl, teacher_mask,
+            )
 
         if self.training and self.mixup_alpha > 0:
             waveform, target = self._sumix(waveform, target)
@@ -217,14 +284,12 @@ class BirdCLEFWrapper(pl.LightningModule):
                 total_loss = supervised_loss
 
         # Pseudo-label distillation: match teacher logits on pseudo-labeled samples
-        if "teacher_logits" in batch and self.pseudo_distill_weight > 0:
-            teacher_logits_pl = batch["teacher_logits"]
-            mask = batch["teacher_logits_mask"]
-            if mask.sum() > 0:
+        if teacher_logits_pl is not None and self.pseudo_distill_weight > 0:
+            if teacher_mask.sum() > 0:
                 # Student logits on target classes (same shape as teacher logits)
                 student_logits_target = output_dict["logits"]
                 pseudo_distill_loss = self._pseudo_distill_loss(
-                    student_logits_target, teacher_logits_pl, mask)
+                    student_logits_target, teacher_logits_pl, teacher_mask)
                 if torch.isfinite(pseudo_distill_loss):
                     total_loss = total_loss + self.pseudo_distill_weight * pseudo_distill_loss
                 else:
@@ -411,6 +476,12 @@ def main():
     parser.add_argument("--pseudo_labels", type=str, default=None)
     parser.add_argument("--pseudo_distill_weight", type=float, default=1.0,
                         help="Weight for pseudo-label logit distillation loss (KL divergence)")
+    parser.add_argument("--pseudo_power_t", type=float, default=1.0,
+                        help="Power transform exponent T applied to pseudo-label sigmoid(logits) "
+                             "before training (T>1 sharpens, suppresses noise). 1.0 = no transform.")
+    parser.add_argument("--pseudo_mixup_alpha", type=float, default=0.0,
+                        help="Beta(α,α) for cross-domain MixUp between pseudo soundscape chunks "
+                             "and labeled focal samples. 0 = off. Babych'25 1st-place self-training.")
     parser.add_argument("--balance_alpha", type=float, default=0.5)
 
     parser.add_argument("--distill_manifest", type=str, default=None,
@@ -469,6 +540,7 @@ def main():
         preload=args.preload,
         valid_regions_path=args.valid_regions,
         pseudo_labels_csv=args.pseudo_labels,
+        pseudo_power_t=args.pseudo_power_t,
         balance_alpha=args.balance_alpha,
         full_files=args.full_files,
         distill_manifest=args.distill_manifest,
@@ -509,6 +581,7 @@ def main():
         teacher_model=teacher,
         idx_to_label=idx_to_label,
         pseudo_distill_weight=args.pseudo_distill_weight,
+        pseudo_mixup_alpha=args.pseudo_mixup_alpha,
     )
 
     # --- Warm-start: load model weights from a prior checkpoint ---
@@ -572,6 +645,8 @@ def main():
                 "distill_temperature": args.distill_temperature,
                 "pseudo_labels": args.pseudo_labels,
                 "pseudo_distill_weight": args.pseudo_distill_weight,
+                "pseudo_power_t": args.pseudo_power_t,
+                "pseudo_mixup_alpha": args.pseudo_mixup_alpha,
                 "warmstart": args.warmstart,
                 "balance_alpha": args.balance_alpha,
                 "min_duration": args.min_duration,
