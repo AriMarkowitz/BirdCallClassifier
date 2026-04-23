@@ -54,7 +54,7 @@ PSEUDO_DISTILL_WEIGHT="${PSEUDO_DISTILL_WEIGHT:-1.0}"
 PSEUDO_POWER_T="${PSEUDO_POWER_T:-2.0}"  # T>1 sharpens pseudo soft labels; suppresses mid-range noise
 PSEUDO_MIXUP_ALPHA="${PSEUDO_MIXUP_ALPHA:-0.4}"  # cross-domain MixUp pseudo↔labeled (Babych'25)
 RETRAIN_EPOCHS="${RETRAIN_EPOCHS:-20}"
-RETRAIN_LR="${RETRAIN_LR:-1e-4}"
+RETRAIN_LR="${RETRAIN_LR:-2e-4}"
 
 VALID_REGIONS="$PROJECT_DIR/data/valid_regions.json"
 PSEUDO_CSV="$PROJECT_DIR/data/pseudo_labels.csv"
@@ -90,10 +90,10 @@ if [ -z "$CKPT" ]; then
 
     python src/train.py \
         --data_dir "$PROJECT_DIR/data" \
-        --batch_size 16 \
+        --batch_size 64 \
         --num_workers 8 \
         --max_epochs 40 \
-        --lr 5e-5 \
+        --lr 1.5e-4 \
         --precision bf16 \
         --save_dir "$CKPT_DIR" \
         --seed "$SEED" \
@@ -168,7 +168,7 @@ echo "  Pseudo power-T: $PSEUDO_POWER_T, mixup α: $PSEUDO_MIXUP_ALPHA"
 
 python src/train.py \
     --data_dir "$PROJECT_DIR/data" \
-    --batch_size 16 \
+    --batch_size 64 \
     --num_workers 8 \
     --max_epochs "$RETRAIN_EPOCHS" \
     --lr "$RETRAIN_LR" \
