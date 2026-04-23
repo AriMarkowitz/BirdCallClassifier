@@ -6,21 +6,28 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
 #SBATCH --mem=64G
-#SBATCH --time=24:00:00
+#SBATCH --time=48:00:00
 #SBATCH --output=logs/pipeline_%j.log
 #SBATCH --error=logs/pipeline_%j.log
 
-# ── Pseudo-labeling pipeline ──
+# ── Multi-iteration self-training pipeline (Babych'25 1st-place) ──
+#
+# Each iteration: pseudo-label with current teacher → retrain student → promote best
+# student as next teacher. Default 3 iterations.
 #
 # Usage:
-#   # Pseudo-label from existing checkpoint, then retrain:
-#   CKPT=checkpoints/xxx/birdclef-birdset-epoch=38-val_macro_auc=0.8877.ckpt sbatch scripts/pipeline.sh
+#   # Multi-iteration self-training from existing baseline checkpoint:
+#   CKPT=checkpoints/xxx/birdclef-birdset-epoch=25-val_macro_auc=0.9686.ckpt \
+#     sbatch scripts/pipeline.sh
 #
-#   # Full pipeline (train from scratch → pseudo-label → retrain):
+#   # Full pipeline (train baseline from scratch → N iterations of self-training):
 #   sbatch scripts/pipeline.sh
 #
-#   # Customize threshold/fold:
-#   CKPT=path/to/best.ckpt THRESHOLD=0.7 FOLD=2 sbatch scripts/pipeline.sh
+#   # Reuse existing iter1 pseudo-labels (skip Step 2 of iteration 1 only):
+#   CKPT=path/to/ckpt SKIP_PSEUDO=1 sbatch scripts/pipeline.sh
+#
+#   # Customize iterations / threshold / LR:
+#   CKPT=path/to/ckpt N_ITERATIONS=4 THRESHOLD=0.7 RETRAIN_LR=5e-5 sbatch scripts/pipeline.sh
 
 PROJECT_DIR="$HOME/BirdCallClassifier"
 ENV_NAME="birdcallclassifier"
@@ -54,7 +61,8 @@ PSEUDO_DISTILL_WEIGHT="${PSEUDO_DISTILL_WEIGHT:-1.0}"
 PSEUDO_POWER_T="${PSEUDO_POWER_T:-2.0}"  # T>1 sharpens pseudo soft labels; suppresses mid-range noise
 PSEUDO_MIXUP_ALPHA="${PSEUDO_MIXUP_ALPHA:-0.4}"  # cross-domain MixUp pseudo↔labeled (Babych'25)
 RETRAIN_EPOCHS="${RETRAIN_EPOCHS:-20}"
-RETRAIN_LR="${RETRAIN_LR:-2e-4}"
+RETRAIN_LR="${RETRAIN_LR:-2e-5}"  # 10x lower than baseline; warm-start was destabilizing at 2e-4
+N_ITERATIONS="${N_ITERATIONS:-3}"  # Babych'25 ran 4; gains taper after 3
 
 VALID_REGIONS="$PROJECT_DIR/data/valid_regions.json"
 PSEUDO_CSV="$PROJECT_DIR/data/pseudo_labels.csv"
@@ -126,79 +134,113 @@ else
     echo "=== Step 1: Using provided checkpoint: $CKPT ==="
 fi
 
-# ── Step 2: Pseudo-label ──
-if [ "$SKIP_PSEUDO" = "1" ] && [ -f "$PSEUDO_CSV" ] && [ -f "${PSEUDO_CSV%.csv}.npz" ]; then
-    echo ""
-    echo "=== Step 2: Skipping pseudo-labeling (SKIP_PSEUDO=1, reusing $PSEUDO_CSV) ==="
-    N_PSEUDO=$(tail -n +2 "$PSEUDO_CSV" 2>/dev/null | wc -l)
-    echo "Existing pseudo-labeled segments: $N_PSEUDO"
-else
-    echo ""
-    echo "=== Step 2: Pseudo-labeling (threshold=$THRESHOLD) ==="
+# ── Self-training loop: N iterations of (pseudo-label → retrain) ──
+# Each iteration uses the previous iteration's best checkpoint as teacher.
+# Babych'25 1st-place ran 4 iterations; gains: 0.909 → 0.918 → 0.927 → 0.930.
 
-    python scripts/pseudo_label.py \
-        --checkpoint "$CKPT" \
-        --data-dir "$PROJECT_DIR/data" \
-        --output "$PSEUDO_CSV" \
-        --threshold "$THRESHOLD" \
-        --max-per-species "$MAX_PER_SPECIES" \
-        --match-train-distribution \
-        --batch-size 64 \
+CURRENT_CKPT="$CKPT"
+echo ""
+echo "=== Self-training loop: $N_ITERATIONS iterations ==="
+echo "Initial teacher: $CURRENT_CKPT"
+
+for ITER in $(seq 1 "$N_ITERATIONS"); do
+    echo ""
+    echo "════════════════════════════════════════════════"
+    echo "  Iteration $ITER / $N_ITERATIONS"
+    echo "  Teacher checkpoint: $CURRENT_CKPT"
+    echo "════════════════════════════════════════════════"
+
+    ITER_PSEUDO_CSV="${PSEUDO_CSV%.csv}_iter${ITER}.csv"
+    RUN_ID_ITER="${JOB_ID}_fold${FOLD}_iter${ITER}"
+
+    # ── Step 2: Pseudo-label with current teacher ──
+    # SKIP_PSEUDO only applies to iteration 1 (reuse the canonical pseudo_labels.csv).
+    if [ "$ITER" = "1" ] && [ "$SKIP_PSEUDO" = "1" ] \
+        && [ -f "$PSEUDO_CSV" ] && [ -f "${PSEUDO_CSV%.csv}.npz" ]; then
+        echo ""
+        echo "--- Step 2 (iter $ITER): Reusing existing $PSEUDO_CSV (SKIP_PSEUDO=1) ---"
+        cp "$PSEUDO_CSV" "$ITER_PSEUDO_CSV"
+        cp "${PSEUDO_CSV%.csv}.npz" "${ITER_PSEUDO_CSV%.csv}.npz"
+        N_PSEUDO=$(tail -n +2 "$ITER_PSEUDO_CSV" 2>/dev/null | wc -l)
+    else
+        echo ""
+        echo "--- Step 2 (iter $ITER): Pseudo-labeling (threshold=$THRESHOLD) ---"
+        python scripts/pseudo_label.py \
+            --checkpoint "$CURRENT_CKPT" \
+            --data-dir "$PROJECT_DIR/data" \
+            --output "$ITER_PSEUDO_CSV" \
+            --threshold "$THRESHOLD" \
+            --max-per-species "$MAX_PER_SPECIES" \
+            --match-train-distribution \
+            --batch-size 64 \
+            --use_wandb \
+            --wandb_project birdclef-2026 \
+            --run_name "pseudo-label-${RUN_ID_ITER}"
+
+        N_PSEUDO=$(tail -n +2 "$ITER_PSEUDO_CSV" 2>/dev/null | wc -l)
+    fi
+    echo "Pseudo-labeled segments (iter $ITER): $N_PSEUDO"
+
+    if [ "$N_PSEUDO" -eq 0 ]; then
+        echo "WARNING: No pseudo-labels generated at iteration $ITER. Stopping loop."
+        break
+    fi
+
+    # ── Step 3: Retrain (warm-started from current teacher) ──
+    echo ""
+    echo "--- Step 3 (iter $ITER): Retraining (run=$RUN_ID_ITER) ---"
+    echo "  Warm-starting from: $CURRENT_CKPT"
+    echo "  Retrain LR: $RETRAIN_LR, Epochs: $RETRAIN_EPOCHS"
+    echo "  Pseudo-distill weight: $PSEUDO_DISTILL_WEIGHT"
+    echo "  Pseudo power-T: $PSEUDO_POWER_T, mixup α: $PSEUDO_MIXUP_ALPHA"
+
+    python src/train.py \
+        --data_dir "$PROJECT_DIR/data" \
+        --batch_size 64 \
+        --num_workers 8 \
+        --max_epochs "$RETRAIN_EPOCHS" \
+        --lr "$RETRAIN_LR" \
+        --precision bf16 \
+        --save_dir "$CKPT_DIR" \
+        --seed "$SEED" \
+        --loss focal \
+        --label_smoothing 0.05 \
+        --n_folds 5 \
+        --fold "$FOLD" \
+        --min_duration "$MIN_DURATION" \
+        --max_duration "$MAX_DURATION" \
+        --full_files \
+        --no_distill \
+        --balance_alpha 0.5 \
         --use_wandb \
         --wandb_project birdclef-2026 \
-        --run_name "pseudo-label-${JOB_ID}_fold${FOLD}"
+        --run_name "enet-${RUN_ID_ITER}" \
+        --run_id "$RUN_ID_ITER" \
+        --valid_regions "$VALID_REGIONS" \
+        --pseudo_labels "$ITER_PSEUDO_CSV" \
+        --pseudo_distill_weight "$PSEUDO_DISTILL_WEIGHT" \
+        --pseudo_power_t "$PSEUDO_POWER_T" \
+        --pseudo_mixup_alpha "$PSEUDO_MIXUP_ALPHA" \
+        --warmstart "$CURRENT_CKPT" \
+        $DISTILL_MANIFEST_ARG \
+        $HARD_NEG_ARG
 
-    N_PSEUDO=$(tail -n +2 "$PSEUDO_CSV" 2>/dev/null | wc -l)
-    echo "Pseudo-labeled segments: $N_PSEUDO"
-fi
-
-if [ "$N_PSEUDO" -eq 0 ]; then
-    echo "WARNING: No pseudo-labels generated. Skipping retrain."
-    exit 0
-fi
-
-# ── Step 3: Retrain with pseudo-labels (warm-started from round 1) ──
-RUN_ID_R2="${JOB_ID}_fold${FOLD}_r2"
-echo ""
-echo "=== Step 3: Retraining with pseudo-labels (run=$RUN_ID_R2) ==="
-echo "  Warm-starting from: $CKPT"
-echo "  Retrain LR: $RETRAIN_LR, Epochs: $RETRAIN_EPOCHS"
-echo "  Pseudo-distill weight: $PSEUDO_DISTILL_WEIGHT"
-echo "  Pseudo power-T: $PSEUDO_POWER_T, mixup α: $PSEUDO_MIXUP_ALPHA"
-
-python src/train.py \
-    --data_dir "$PROJECT_DIR/data" \
-    --batch_size 64 \
-    --num_workers 8 \
-    --max_epochs "$RETRAIN_EPOCHS" \
-    --lr "$RETRAIN_LR" \
-    --precision bf16 \
-    --save_dir "$CKPT_DIR" \
-    --seed "$SEED" \
-    --loss focal \
-    --label_smoothing 0.05 \
-    --n_folds 5 \
-    --fold "$FOLD" \
-    --min_duration "$MIN_DURATION" \
-    --max_duration "$MAX_DURATION" \
-    --full_files \
-    --no_distill \
-    --balance_alpha 0.5 \
-    --use_wandb \
-    --wandb_project birdclef-2026 \
-    --run_name "enet-${RUN_ID_R2}" \
-    --run_id "$RUN_ID_R2" \
-    --valid_regions "$VALID_REGIONS" \
-    --pseudo_labels "$PSEUDO_CSV" \
-    --pseudo_distill_weight "$PSEUDO_DISTILL_WEIGHT" \
-    --pseudo_power_t "$PSEUDO_POWER_T" \
-    --pseudo_mixup_alpha "$PSEUDO_MIXUP_ALPHA" \
-    --warmstart "$CKPT" \
-    $DISTILL_MANIFEST_ARG \
-    $HARD_NEG_ARG
+    # ── Promote best checkpoint from this iteration as next teacher ──
+    # Pick the ckpt with highest val_macro_auc (parsed from filename).
+    NEXT_CKPT=$(ls "$CKPT_DIR/$RUN_ID_ITER"/birdclef-birdset-*.ckpt 2>/dev/null \
+        | awk -F'val_macro_auc=' '{print $2"\t"$0}' \
+        | sort -k1,1 -gr \
+        | head -1 | cut -f2-)
+    if [ -z "$NEXT_CKPT" ]; then
+        echo "ERROR: No checkpoint found in $CKPT_DIR/$RUN_ID_ITER/ — stopping loop"
+        break
+    fi
+    echo ""
+    echo "Iteration $ITER complete. Best ckpt: $NEXT_CKPT"
+    CURRENT_CKPT="$NEXT_CKPT"
+done
 
 echo ""
 echo "=== Pipeline complete ==="
-echo "Source checkpoint: $CKPT"
-echo "Pseudo-labels: $PSEUDO_CSV ($N_PSEUDO segments)"
-echo "Retrained checkpoints: $CKPT_DIR/$RUN_ID_R2/"
+echo "Initial teacher: $CKPT"
+echo "Final teacher:   $CURRENT_CKPT"
