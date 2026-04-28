@@ -29,7 +29,40 @@ fi
 # Always sync model code so inference uses the current architecture
 mkdir -p "$KAGGLE_DS/src"
 cp "$PROJECT_DIR/src/model.py" "$KAGGLE_DS/src/model.py"
-echo "Synced src/model.py to kaggle_dataset/"
+cp "$PROJECT_DIR/src/backbones.py" "$KAGGLE_DS/src/backbones.py"
+echo "Synced src/{model.py,backbones.py} to kaggle_dataset/"
+
+# Sync BirdSet HF configs locally so inference works offline (Kaggle disables internet).
+# backbones.py looks for kaggle_dataset/src/configs/<safe-name>/config.json.
+# Strategy: copy already-cached config.json from ~/.cache/huggingface/hub.
+# If not cached locally, fall back to downloading via the conda env that has hf_hub.
+mkdir -p "$KAGGLE_DS/src/configs"
+HF_CACHE="${HF_HOME:-$HOME/.cache/huggingface}/hub"
+for hf_name in \
+    "DBD-research-group/EfficientNet-B1-BirdSet-XCL" \
+    "DBD-research-group/EfficientNet-B0-BirdSet-XCL"; do
+    safe="${hf_name//\//__}"
+    dest="$KAGGLE_DS/src/configs/$safe"
+    mkdir -p "$dest"
+    # Find config.json in HF cache
+    cached=$(find "$HF_CACHE/models--${hf_name//\//--}/snapshots" \
+                  -name config.json 2>/dev/null | head -1)
+    if [ -n "$cached" ] && [ -f "$cached" ]; then
+        cp "$cached" "$dest/config.json"
+        echo "  Cached config for $hf_name (from local HF cache)"
+    else
+        echo "  No local cache for $hf_name; attempting to download..."
+        if python -c "from huggingface_hub import hf_hub_download; \
+                      import shutil, os; \
+                      p = hf_hub_download('$hf_name', 'config.json'); \
+                      shutil.copy(p, '$dest/config.json'); \
+                      print('  Downloaded config for $hf_name')" 2>/dev/null; then
+            :
+        else
+            echo "  WARNING: Could not get config for $hf_name (skipping — only matters if you submit a $hf_name ckpt)"
+        fi
+    fi
+done
 
 # Clear old checkpoints
 rm -f "$KAGGLE_DS"/birdclef-birdset-*.ckpt "$KAGGLE_DS"/birdclef-htsat-*.ckpt
@@ -57,12 +90,28 @@ if [ $# -gt 0 ]; then
             echo "ERROR: No checkpoints in $run_dir"
             exit 1
         fi
-        # Use unique name per fold to avoid overwrites when filenames collide
+        # Use unique name per fold to avoid overwrites when filenames collide.
+        # Inject backbone name into destination so inference.py can detect it
+        # from filename (Kaggle strips '=' from filenames in dataset uploads).
         ext="${picked##*.}"
         base="$(basename "$picked" ".$ext")"
-        dest="$KAGGLE_DS/${base}_fold${FOLD_IDX}.${ext}"
+        # Extract backbone hint from run_id; supported names listed below.
+        # If absent, fall back to 'birdset_b1' (covers legacy ckpts).
+        backbone_hint="birdset_b1"
+        # Order matters: check long names BEFORE short ones (e.g. mobilenetv3_large
+        # before mobilenetv3_small), and efficientnetv2_b0 before efficientnet_b0.
+        for bb in efficientnetv2_b0 efficientnet_b0 \
+                  mobilenetv3_large mobilenetv3_small \
+                  resnet18 convnext_tiny regnety_002 \
+                  birdset_b0 birdset_b1; do
+            if [[ "$run_id" == *"$bb"* ]]; then
+                backbone_hint="$bb"
+                break
+            fi
+        done
+        dest="$KAGGLE_DS/${base}_${backbone_hint}_fold${FOLD_IDX}.${ext}"
         cp "$picked" "$dest"
-        echo "  Copied: $(basename "$dest") (from $run_id)"
+        echo "  Copied: $(basename "$dest") (from $run_id, backbone=$backbone_hint)"
         FOLD_IDX=$((FOLD_IDX + 1))
     done
 else

@@ -46,8 +46,48 @@ SEGMENT_DURATION = 5.0  # seconds — matches soundscape label format
 SEGMENT_SAMPLES = int(SAMPLE_RATE * SEGMENT_DURATION)
 
 
-def load_model(checkpoint_path, num_classes, device):
-    """Load a trained BirdCLEFWrapper from a Lightning checkpoint."""
+def _detect_backbone_from_state_dict(cleaned):
+    """Heuristic: pick backbone name by inspecting which keys are present.
+
+    We can't always tell the exact backbone, but we can distinguish:
+      - 'backbone.hf_model.efficientnet.*'    -> birdset_b1 (or birdset_b0 — same module path)
+      - 'backbone.model.*'                    -> any timm backbone
+      - 'birdset_model.efficientnet.*'        -> legacy ckpt (pre-refactor) — use birdset_b1
+    """
+    has_hf = any(k.startswith("backbone.hf_model.") for k in cleaned)
+    has_timm = any(k.startswith("backbone.model.") for k in cleaned)
+    legacy = any(k.startswith("birdset_model.") for k in cleaned)
+    if has_hf:
+        return "birdset_b1"
+    if has_timm:
+        # Best-effort: we can't recover which timm model from state dict alone.
+        # Caller should pass --backbone explicitly for timm ckpts.
+        return None
+    if legacy:
+        return "birdset_b1"
+    return None
+
+
+def _remap_legacy_keys(cleaned):
+    """Map pre-refactor state dict keys (birdset_model.*) to new (backbone.hf_model.*)."""
+    if not any(k.startswith("birdset_model.") for k in cleaned):
+        return cleaned
+    remapped = {}
+    for k, v in cleaned.items():
+        if k.startswith("birdset_model."):
+            remapped["backbone.hf_model." + k[len("birdset_model."):]] = v
+        else:
+            remapped[k] = v
+    return remapped
+
+
+def load_model(checkpoint_path, num_classes, device, backbone=None):
+    """Load a trained BirdCLEFModel from a Lightning checkpoint.
+
+    Args:
+        backbone: backbone name; if None, auto-detect from state dict (only
+                  reliable for BirdSet ckpts — timm ckpts must specify).
+    """
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state_dict = ckpt.get("state_dict", ckpt)
 
@@ -57,6 +97,8 @@ def load_model(checkpoint_path, num_classes, device):
         k = k.replace("model.model.", "model.")
         k = k.replace("model.", "", 1) if k.startswith("model.") else k
         cleaned[k] = v
+
+    cleaned = _remap_legacy_keys(cleaned)
 
     # Detect if checkpoint was trained with hard-negative extra classes
     head_weight_key = "head.5.weight"
@@ -68,20 +110,50 @@ def load_model(checkpoint_path, num_classes, device):
             logger.info(f"  Checkpoint has {ckpt_out_classes} train classes "
                         f"(target: {num_classes}, extra: {ckpt_out_classes - num_classes})")
 
+    if backbone is None:
+        backbone = _detect_backbone_from_state_dict(cleaned)
+    if backbone is None:
+        raise ValueError(
+            f"Cannot auto-detect backbone for {checkpoint_path}. "
+            f"Pass --backbone explicitly (e.g. efficientnet_b0, mobilenetv3_small)."
+        )
+
     model = BirdCLEFModel(
         num_classes=num_classes,
         num_train_classes=num_train_classes,
         sample_rate=SAMPLE_RATE,
+        backbone_name=backbone,
         pretrained=False,
     )
 
     missing, unexpected = model.load_state_dict(cleaned, strict=True)
     assert not missing, f"Missing keys loading {checkpoint_path}: {missing}"
-    logger.info(f"Loaded checkpoint: {checkpoint_path}")
+    logger.info(f"Loaded checkpoint ({backbone}): {checkpoint_path}")
 
     model = model.to(device)
     model.eval()
     return model
+
+
+class EnsembleModel(torch.nn.Module):
+    """Averages logits/probs across multiple models. Same interface as a single model."""
+
+    def __init__(self, models):
+        super().__init__()
+        self.models = torch.nn.ModuleList(models)
+
+    def forward(self, x):
+        logits_list = []
+        for m in self.models:
+            with torch.no_grad():
+                out = m(x)
+            logits_list.append(out["logits"])
+        # Average logits across the ensemble; recompute probs from averaged logits
+        avg_logits = torch.stack(logits_list, dim=0).mean(dim=0)
+        return {
+            "logits": avg_logits,
+            "clipwise_output": torch.sigmoid(avg_logits),
+        }
 
 
 def load_soundscape_audio(path, sample_rate=SAMPLE_RATE):
@@ -153,7 +225,15 @@ def predict_file(model, audio, device, batch_size=32):
 def main():
     parser = argparse.ArgumentParser(
         description="Generate pseudo-labels for unlabeled soundscapes")
-    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Single checkpoint path (use --checkpoints for ensemble).")
+    parser.add_argument("--checkpoints", type=str, default=None,
+                        help="Comma-separated checkpoint paths for ensemble averaging. "
+                             "Logits are averaged across all listed ckpts.")
+    parser.add_argument("--backbones", type=str, default=None,
+                        help="Comma-separated backbone names matching --checkpoints "
+                             "(needed for non-BirdSet ckpts since timm backbones can't "
+                             "be auto-detected from state dict).")
     parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--output", type=str, default="data/pseudo_labels.csv")
     parser.add_argument("--threshold", type=float, default=0.8)
@@ -184,7 +264,33 @@ def main():
     idx_to_label = {v: k for k, v in label_map.items()}
     logger.info(f"Classes: {num_classes}")
 
-    model = load_model(args.checkpoint, num_classes, device)
+    # Resolve checkpoints: prefer --checkpoints (ensemble) over --checkpoint (single)
+    if args.checkpoints:
+        ckpt_paths = [p.strip() for p in args.checkpoints.split(",") if p.strip()]
+    elif args.checkpoint:
+        ckpt_paths = [args.checkpoint]
+    else:
+        parser.error("Must provide --checkpoint or --checkpoints")
+
+    backbones = None
+    if args.backbones:
+        backbones = [b.strip() for b in args.backbones.split(",") if b.strip()]
+        if len(backbones) != len(ckpt_paths):
+            parser.error(
+                f"--backbones has {len(backbones)} entries but --checkpoints has {len(ckpt_paths)}"
+            )
+
+    members = []
+    for i, path in enumerate(ckpt_paths):
+        bb = backbones[i] if backbones else None
+        members.append(load_model(path, num_classes, device, backbone=bb))
+
+    if len(members) == 1:
+        model = members[0]
+        logger.info("Pseudo-labeling with a single model")
+    else:
+        model = EnsembleModel(members).to(device).eval()
+        logger.info(f"Pseudo-labeling with an ensemble of {len(members)} models")
 
     # --- Collect files to pseudo-label ---
     soundscape_dir = data_dir / "train_soundscapes"

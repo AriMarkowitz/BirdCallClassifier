@@ -426,13 +426,26 @@ def main():
     parser = argparse.ArgumentParser(description="Fine-tune BirdSet EfficientNet on BirdCLEF 2026")
     parser.add_argument("--data_dir", type=str, default=os.path.join(PROJ_ROOT, "data"))
     parser.add_argument(
+        "--backbone",
+        type=str,
+        default="birdset_b1",
+        help="Backbone identifier: birdset_b1 (default), birdset_b0, "
+             "efficientnet_b0, mobilenetv3_small, resnet18, convnext_tiny, "
+             "or 'hf:Org/Model' for arbitrary HF audio models.",
+    )
+    parser.add_argument(
         "--birdset_model_name",
         type=str,
         default="DBD-research-group/EfficientNet-B1-BirdSet-XCL",
-        help="HF model id for BirdSet EfficientNet backbone",
+        help="HF model id for BirdSet teacher when --distill is set "
+             "(separate from --backbone).",
     )
     parser.add_argument("--max_time_frames", type=int, default=768)
     parser.add_argument("--chunk_hop_frames", type=int, default=512)
+    parser.add_argument("--save_top_k", type=int, default=1,
+                        help="Number of best ckpts to retain per run (disk-saver).")
+    parser.add_argument("--compile", action="store_true",
+                        help="torch.compile the model (20-40%% speedup if it works).")
 
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -517,8 +530,10 @@ def main():
     label_map = build_label_map(os.path.join(args.data_dir, "taxonomy.csv"))
     num_classes = len(label_map)
 
-    logger.info("=== BirdSet EfficientNet training ===")
-    logger.info(f"BirdSet backbone: {args.birdset_model_name}")
+    logger.info("=== BirdCLEF training ===")
+    logger.info(f"Backbone: {args.backbone}")
+    if args.distill:
+        logger.info(f"BirdSet teacher (distill): {args.birdset_model_name}")
     logger.info(f"Variable-length input: {args.min_duration}s - {args.max_duration}s")
     if args.full_files:
         logger.info("Full-file mode enabled for train_audio (no cropping)")
@@ -556,13 +571,20 @@ def main():
         num_classes=num_classes,
         num_train_classes=num_train_classes,
         sample_rate=32000,
-        birdset_model_name=args.birdset_model_name,
+        backbone_name=args.backbone,
         max_time_frames=args.max_time_frames,
         chunk_hop_frames=args.chunk_hop_frames,
         pretrained=True,
     )
     logger.info(f"Model params: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M"
                 f" (head outputs {num_train_classes} classes)")
+
+    if args.compile:
+        try:
+            model = torch.compile(model)
+            logger.info("torch.compile enabled")
+        except Exception as exc:
+            logger.warning(f"torch.compile failed ({exc}); continuing without")
 
     teacher = _build_teacher(args.birdset_model_name) if args.distill else None
 
@@ -613,7 +635,7 @@ def main():
         filename="birdclef-birdset-{epoch:02d}-{val_macro_auc:.4f}",
         monitor="val_macro_auc",
         mode="max",
-        save_top_k=5,
+        save_top_k=args.save_top_k,
     )
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
 
@@ -631,6 +653,7 @@ def main():
                 "seed": args.seed,
                 "fold": args.fold,
                 "n_folds": args.n_folds,
+                "backbone": args.backbone,
                 "birdset_model_name": args.birdset_model_name,
                 "max_time_frames": args.max_time_frames,
                 "chunk_hop_frames": args.chunk_hop_frames,

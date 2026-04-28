@@ -1,25 +1,26 @@
 """
-BirdSet-EfficientNet-based model for BirdCLEF multi-label bird call classification.
+Modular audio classifier for BirdCLEF multi-label bird call classification.
 
 Architecture:
-  - BirdSet pretrained EfficientNet-B1 backbone from Hugging Face
-    (DBD-research-group/EfficientNet-B1-BirdSet-XCL).
-  - BirdSet-compatible log-mel frontend (32kHz, n_fft=2048, hop=256, n_mels=256,
-    power->dB, mean/std normalization).
-  - Temporal attention pooling (SED-style): collapses the encoder's spatial
-    feature map to a single vector by attending over time frames with a
-    learnable CLS query, so the model can focus on frames that contain calls
-    rather than averaging over silence.
-  - MLP head on the attended 1280-dim features for BirdCLEF classification.
-  - BirdSet classifier logits still available for teacher-student distillation.
+  - Shared BirdSet-compatible log-mel frontend (32kHz, n_fft=2048, hop=256,
+    n_mels=256, power->dB, mean/std normalization).
+  - Pluggable backbone via src.backbones.build_backbone(name). Default is
+    BirdSet EfficientNet-B1; supports timm CNNs (efficientnet_b0,
+    mobilenetv3_small, resnet18, convnext_tiny) and any HuggingFace audio
+    model via 'hf:Org/Model'.
+  - Temporal attention pooling (SED-style): collapses the encoder's feature
+    map to a single vector by attending over time frames with a learnable
+    CLS query.
+  - MLP head on attended features for BirdCLEF classification.
+  - BirdSet classifier logits exposed when backbone supports distillation.
 
 Input: raw waveform tensor (B, T) or (B, 1, T) with variable T.
 Output dict: {
     "clipwise_output": (B, num_classes),
     "logits": (B, num_classes),
     "latent_output": (B, hidden_dim),
-    "student_birdset_logits": (B, birdset_num_classes),
-    "attn_weights": (B, T_frames)   -- which time frames were attended to
+    "student_birdset_logits": (B, birdset_num_classes) or None,
+    "attn_weights": (B, T_frames)
 }
 """
 
@@ -27,13 +28,7 @@ import torch
 import torch.nn as nn
 import torchaudio.transforms as T
 
-try:
-    from transformers import EfficientNetForImageClassification
-except Exception as exc:
-    EfficientNetForImageClassification = None
-    _TRANSFORMERS_IMPORT_ERROR = exc
-else:
-    _TRANSFORMERS_IMPORT_ERROR = None
+from backbones import build_backbone
 
 
 class TemporalAttentionPool(nn.Module):
@@ -117,22 +112,24 @@ class TemporalAttentionPool(nn.Module):
 
 
 class BirdCLEFModel(nn.Module):
-    """BirdSet EfficientNet-B1 + temporal attention pooling + MLP head.
+    """Modular audio classifier: shared frontend + pluggable backbone + attn pool + MLP head.
 
     Args:
-        num_classes: Number of BirdCLEF classes.
+        num_classes: Number of BirdCLEF target classes.
         sample_rate: Audio sample rate.
-        birdset_model_name: HF model id for BirdSet EfficientNet.
+        backbone_name: Backbone identifier — see src.backbones.build_backbone.
+                       Defaults to BirdSet EfficientNet-B1 for backward compat.
         pretrained: If False, initializes from config only (for checkpoint loading).
         attn_heads: Number of attention heads in temporal pooling.
         attn_dropout: Dropout on attention weights.
+        num_train_classes: Head output size (>= num_classes if hard negatives).
     """
 
     def __init__(
         self,
         num_classes,
         sample_rate=32000,
-        birdset_model_name="DBD-research-group/EfficientNet-B1-BirdSet-XCL",
+        backbone_name="birdset_b1",
         max_time_frames=768,
         chunk_hop_frames=512,
         pretrained=True,
@@ -141,11 +138,6 @@ class BirdCLEFModel(nn.Module):
         num_train_classes=None,
     ):
         super().__init__()
-        if EfficientNetForImageClassification is None:
-            raise ImportError(
-                "transformers is required for BirdSet backbone. "
-                "Install with: pip install transformers safetensors"
-            ) from _TRANSFORMERS_IMPORT_ERROR
 
         self.num_classes = num_classes
         # num_train_classes >= num_classes when hard-negative extra classes are used.
@@ -155,8 +147,9 @@ class BirdCLEFModel(nn.Module):
         self.sample_rate = sample_rate
         self.max_time_frames = int(max_time_frames)
         self.chunk_hop_frames = int(chunk_hop_frames)
+        self.backbone_name = backbone_name
 
-        # BirdSet-compatible frontend settings
+        # BirdSet-compatible frontend settings (shared across all backbones)
         self.n_fft = 2048
         self.hop_length = 256
         self.n_mels = 256
@@ -193,34 +186,19 @@ class BirdCLEFModel(nn.Module):
             persistent=False,
         )
 
-        if pretrained:
-            self.birdset_model = EfficientNetForImageClassification.from_pretrained(
-                birdset_model_name,
-                num_channels=1,
-                ignore_mismatched_sizes=True,
-            )
-        else:
-            from transformers import EfficientNetConfig
-            config = EfficientNetConfig.from_pretrained(
-                birdset_model_name,
-                local_files_only=True,
-            )
-            config.num_channels = 1
-            self.birdset_model = EfficientNetForImageClassification(config)
-
-        birdset_dim = int(self.birdset_model.config.num_labels)
-        hidden_dim = int(self.birdset_model.config.hidden_dim)  # 1280 for B1
+        # Pluggable backbone
+        self.backbone = build_backbone(backbone_name, pretrained=pretrained)
+        hidden_dim = int(self.backbone.out_channels)
         self.latent_dim = hidden_dim
 
-        # Temporal attention pooling -- replaces AvgPool2d from the backbone.
+        # Temporal attention pooling -- collapses (B, C, H, W) to (B, C)
         self.attn_pool = TemporalAttentionPool(
             hidden_dim=hidden_dim,
             num_heads=attn_heads,
             dropout=attn_dropout,
         )
 
-        # MLP head on attended 1280-dim features.
-        # Outputs num_train_classes logits (>= num_classes if hard negatives).
+        # MLP head on attended features.
         self.head = nn.Sequential(
             nn.Dropout(0.3),
             nn.Linear(hidden_dim, 512),
@@ -254,30 +232,17 @@ class BirdCLEFModel(nn.Module):
         return mel
 
     def _backbone_forward(self, mel):
-        """Run encoder and return attended features, attn weights, and BirdSet logits.
+        """Run backbone and return attended features, attn weights, and optional BirdSet logits.
 
         Returns:
-            pooled:           (B, 1280) attended feature vector
+            pooled:           (B, C) attended feature vector
             attn_weights:     (B, T_frames) attention weight per time frame
-            birdset_logits:   (B, birdset_dim) for distillation
+            birdset_logits:   (B, birdset_dim) or None depending on backbone
         """
-        # Run encoder -- bypasses the backbone's own AvgPool2d
-        enc = self.birdset_model.efficientnet.encoder(
-            self.birdset_model.efficientnet.embeddings(mel),
-            return_dict=True,
-        )
-        feat_map = enc.last_hidden_state  # (B, 1280, 8, T_frames)
-
-        # Temporal attention pooling
-        pooled, attn_weights = self.attn_pool(feat_map)  # (B, 1280), (B, T_frames)
-
-        # BirdSet logits (needed for distillation) -- uses backbone's own pooler
-        birdset_pooled = self.birdset_model.efficientnet.pooler(feat_map)
-        birdset_pooled = birdset_pooled.reshape(birdset_pooled.shape[:2])
-        birdset_logits = self.birdset_model.classifier(
-            self.birdset_model.dropout(birdset_pooled)
-        )
-
+        feat_map = self.backbone(mel)  # (B, C, H, W)
+        pooled, attn_weights = self.attn_pool(feat_map)
+        birdset_logits = self.backbone.birdset_logits(feat_map) \
+            if hasattr(self.backbone, "birdset_logits") else None
         return pooled, attn_weights, birdset_logits
 
     def forward_features(self, x, apply_spec_aug=False, return_mel=False):
@@ -324,13 +289,14 @@ class BirdCLEFModel(nn.Module):
             mel_chunk = self._compute_birdset_mel(x[..., start:end])
             c_pooled, _, c_logits = self._backbone_forward(mel_chunk)
             pooled_sum = c_pooled if pooled_sum is None else pooled_sum + c_pooled
-            logits_sum = c_logits if logits_sum is None else logits_sum + c_logits
+            if c_logits is not None:
+                logits_sum = c_logits if logits_sum is None else logits_sum + c_logits
             n_chunks += 1
             if end >= wav_len:
                 break
 
         pooled = pooled_sum / max(n_chunks, 1)
-        birdset_logits = logits_sum / max(n_chunks, 1)
+        birdset_logits = (logits_sum / max(n_chunks, 1)) if logits_sum is not None else None
         # attn_weights not meaningful when averaging across chunks
         attn_weights = torch.zeros(x.shape[0], 1, device=x.device)
         if return_mel:

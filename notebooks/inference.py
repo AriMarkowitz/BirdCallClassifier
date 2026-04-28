@@ -103,12 +103,51 @@ col_indices = np.array([label_map[c] for c in sub_columns])
 
 
 # ── Load model ────────────────────────────────────────────────────────────────
+def _detect_backbone(state_dict, ckpt_path):
+    """Map state-dict signature to backbone name. Filename hint takes priority
+    since timm backbones share the 'backbone.model.*' key prefix.
+    """
+    fname = os.path.basename(ckpt_path).lower()
+    # Order matters: long names first (mobilenetv3_large before mobilenetv3_small;
+    # efficientnetv2_b0 before efficientnet_b0).
+    for hint in ("efficientnetv2_b0", "efficientnet_b0",
+                 "mobilenetv3_large", "mobilenetv3_small",
+                 "resnet18", "convnext_tiny", "regnety_002",
+                 "birdset_b0", "birdset_b1"):
+        if hint in fname:
+            return hint
+    has_hf = any(k.startswith("backbone.hf_model.") for k in state_dict)
+    legacy = any(k.startswith("birdset_model.") for k in state_dict)
+    if has_hf or legacy:
+        return "birdset_b1"
+    raise ValueError(
+        f"Cannot detect backbone for {ckpt_path}. "
+        f"Filename should contain backbone hint (e.g. 'efficientnet_b0_fold0')."
+    )
+
+
+def _remap_legacy_keys(state_dict):
+    """Pre-refactor keys (birdset_model.*) → new (backbone.hf_model.*)."""
+    if not any(k.startswith("birdset_model.") for k in state_dict):
+        return state_dict
+    out = {}
+    for k, v in state_dict.items():
+        if k.startswith("birdset_model."):
+            out["backbone.hf_model." + k[len("birdset_model."):]] = v
+        else:
+            out[k] = v
+    return out
+
+
 def load_model(checkpoint_path):
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state_dict = ckpt["state_dict"]
 
     model_dict = {k.replace("model.", "", 1): v
                   for k, v in state_dict.items() if k.startswith("model.")}
+    model_dict = _remap_legacy_keys(model_dict)
+
+    backbone = _detect_backbone(model_dict, checkpoint_path)
 
     # Detect if checkpoint was trained with hard-negative extra classes
     # by checking the final head layer output size
@@ -125,13 +164,13 @@ def load_model(checkpoint_path):
         num_classes=NUM_CLASSES,
         num_train_classes=num_train_classes,
         sample_rate=SAMPLE_RATE,
-        birdset_model_name=BIRDSET_MODEL_DIR,
+        backbone_name=backbone,
         pretrained=False,
     )
     missing, unexpected = model.load_state_dict(model_dict, strict=True)
     assert not missing, f"Missing keys loading {os.path.basename(checkpoint_path)}: {missing}"
     model.eval()
-    print(f"  Loaded {os.path.basename(checkpoint_path)}")
+    print(f"  Loaded {os.path.basename(checkpoint_path)} (backbone={backbone})")
     return model
 
 
