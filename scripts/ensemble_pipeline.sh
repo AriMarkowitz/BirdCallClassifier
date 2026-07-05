@@ -70,6 +70,13 @@ NUM_WORKERS="${NUM_WORKERS:-8}"
 MIN_DURATION="${MIN_DURATION:-5.0}"
 MAX_DURATION="${MAX_DURATION:-5.0}"
 
+# Head architecture (applies to all 4 ensemble members):
+#   attn_clip — single-CLS-query attention pool + MLP (default, current)
+#   sed_gru   — biGRU + per-frame Linear + PANN-style attention pool (SED-style)
+HEAD="${HEAD:-attn_clip}"
+GRU_HIDDEN="${GRU_HIDDEN:-256}"
+GRU_LAYERS="${GRU_LAYERS:-1}"
+
 # Round 2: all 4 backbones under 40M, real architectural diversity (BirdSet
 # pretrained EfficientNet + ImageNet pretrained EfficientNet/MobileNet/RegNet).
 BACKBONES_CSV="${BACKBONES:-birdset_b1,efficientnet_b0,mobilenetv3_large,regnety_002}"
@@ -146,14 +153,18 @@ else
     for i in $(seq 0 $((N_MODELS - 1))); do
         BACKBONE="${BACKBONES_ARR[$i]}"
         FOLD="${FOLDS_ARR[$i]}"
-        RUN_ID="${JOB_ID}_m${i}_${BACKBONE}_fold${FOLD}_baseline"
+        # Embed head in run_id so submit.sh / inference.py can detect it from filename.
+        RUN_ID="${JOB_ID}_m${i}_${BACKBONE}_${HEAD}_fold${FOLD}_baseline"
         LR=$(get_lr_for_backbone "$BACKBONE")
         echo ""
-        echo "── Baseline model $i/$((N_MODELS-1)): backbone=$BACKBONE, fold=$FOLD, lr=$LR ──"
+        echo "── Baseline model $i/$((N_MODELS-1)): backbone=$BACKBONE, head=$HEAD, fold=$FOLD, lr=$LR ──"
 
         python src/train.py \
             --data_dir "$PROJECT_DIR/data" \
             --backbone "$BACKBONE" \
+            --head "$HEAD" \
+            --gru_hidden "$GRU_HIDDEN" \
+            --gru_layers "$GRU_LAYERS" \
             --batch_size "$BATCH_SIZE" \
             --num_workers "$NUM_WORKERS" \
             --max_epochs "$BASELINE_EPOCHS" \

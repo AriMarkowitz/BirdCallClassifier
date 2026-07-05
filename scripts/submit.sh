@@ -30,7 +30,8 @@ fi
 mkdir -p "$KAGGLE_DS/src"
 cp "$PROJECT_DIR/src/model.py" "$KAGGLE_DS/src/model.py"
 cp "$PROJECT_DIR/src/backbones.py" "$KAGGLE_DS/src/backbones.py"
-echo "Synced src/{model.py,backbones.py} to kaggle_dataset/"
+cp "$PROJECT_DIR/src/sed.py" "$KAGGLE_DS/src/sed.py"
+echo "Synced src/{model.py,backbones.py,sed.py} to kaggle_dataset/"
 
 # Sync BirdSet HF configs locally so inference works offline (Kaggle disables internet).
 # backbones.py looks for kaggle_dataset/src/configs/<safe-name>/config.json.
@@ -39,8 +40,7 @@ echo "Synced src/{model.py,backbones.py} to kaggle_dataset/"
 mkdir -p "$KAGGLE_DS/src/configs"
 HF_CACHE="${HF_HOME:-$HOME/.cache/huggingface}/hub"
 for hf_name in \
-    "DBD-research-group/EfficientNet-B1-BirdSet-XCL" \
-    "DBD-research-group/EfficientNet-B0-BirdSet-XCL"; do
+    "DBD-research-group/EfficientNet-B1-BirdSet-XCL"; do
     safe="${hf_name//\//__}"
     dest="$KAGGLE_DS/src/configs/$safe"
     mkdir -p "$dest"
@@ -91,15 +91,14 @@ if [ $# -gt 0 ]; then
             exit 1
         fi
         # Use unique name per fold to avoid overwrites when filenames collide.
-        # Inject backbone name into destination so inference.py can detect it
-        # from filename (Kaggle strips '=' from filenames in dataset uploads).
+        # Inject backbone (and head if SED) hint into destination so inference.py
+        # can detect them from filename (Kaggle strips '=' from filenames).
         ext="${picked##*.}"
         base="$(basename "$picked" ".$ext")"
-        # Extract backbone hint from run_id; supported names listed below.
-        # If absent, fall back to 'birdset_b1' (covers legacy ckpts).
+        # Extract backbone hint from run_id. Order matters: check long names
+        # BEFORE short ones (mobilenetv3_large before mobilenetv3_small;
+        # efficientnetv2_b0 before efficientnet_b0).
         backbone_hint="birdset_b1"
-        # Order matters: check long names BEFORE short ones (e.g. mobilenetv3_large
-        # before mobilenetv3_small), and efficientnetv2_b0 before efficientnet_b0.
         for bb in efficientnetv2_b0 efficientnet_b0 \
                   mobilenetv3_large mobilenetv3_small \
                   resnet18 convnext_tiny regnety_002 \
@@ -109,9 +108,15 @@ if [ $# -gt 0 ]; then
                 break
             fi
         done
-        dest="$KAGGLE_DS/${base}_${backbone_hint}_fold${FOLD_IDX}.${ext}"
+        # Detect SED head from run_id (head detection has fallback via state-dict
+        # inspection in inference.py; this is just for filename hygiene).
+        head_hint=""
+        if [[ "$run_id" == *"sed_gru"* ]]; then
+            head_hint="_sed_gru"
+        fi
+        dest="$KAGGLE_DS/${base}_${backbone_hint}${head_hint}_fold${FOLD_IDX}.${ext}"
         cp "$picked" "$dest"
-        echo "  Copied: $(basename "$dest") (from $run_id, backbone=$backbone_hint)"
+        echo "  Copied: $(basename "$dest") (from $run_id, backbone=$backbone_hint${head_hint:+, head=sed_gru})"
         FOLD_IDX=$((FOLD_IDX + 1))
     done
 else

@@ -29,6 +29,7 @@ import torch.nn as nn
 import torchaudio.transforms as T
 
 from backbones import build_backbone
+from sed import SEDHead
 
 
 class TemporalAttentionPool(nn.Module):
@@ -130,12 +131,16 @@ class BirdCLEFModel(nn.Module):
         num_classes,
         sample_rate=32000,
         backbone_name="birdset_b1",
+        head_type="attn_clip",
         max_time_frames=768,
         chunk_hop_frames=512,
         pretrained=True,
         attn_heads=8,
         attn_dropout=0.0,
         num_train_classes=None,
+        gru_hidden=256,
+        gru_layers=1,
+        gru_dropout=0.0,
     ):
         super().__init__()
 
@@ -148,6 +153,9 @@ class BirdCLEFModel(nn.Module):
         self.max_time_frames = int(max_time_frames)
         self.chunk_hop_frames = int(chunk_hop_frames)
         self.backbone_name = backbone_name
+        self.head_type = head_type
+        if head_type not in ("attn_clip", "sed_gru"):
+            raise ValueError(f"Unknown head_type: {head_type!r}. Use 'attn_clip' or 'sed_gru'.")
 
         # BirdSet-compatible frontend settings (shared across all backbones)
         self.n_fft = 2048
@@ -191,22 +199,35 @@ class BirdCLEFModel(nn.Module):
         hidden_dim = int(self.backbone.out_channels)
         self.latent_dim = hidden_dim
 
-        # Temporal attention pooling -- collapses (B, C, H, W) to (B, C)
-        self.attn_pool = TemporalAttentionPool(
-            hidden_dim=hidden_dim,
-            num_heads=attn_heads,
-            dropout=attn_dropout,
-        )
-
-        # MLP head on attended features.
-        self.head = nn.Sequential(
-            nn.Dropout(0.3),
-            nn.Linear(hidden_dim, 512),
-            nn.BatchNorm1d(512),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(512, self.num_train_classes),
-        )
+        if head_type == "sed_gru":
+            # SED head bundles the temporal model + classifier.
+            # Outputs both clip-level (used for loss) and frame-level (for SED).
+            self.sed_head = SEDHead(
+                in_channels=hidden_dim,
+                num_classes=self.num_train_classes,
+                gru_hidden=gru_hidden,
+                gru_layers=gru_layers,
+                gru_dropout=gru_dropout,
+            )
+            self.attn_pool = None
+            self.head = None
+            self.latent_dim = 2 * gru_hidden
+        else:
+            # attn_clip head (default): temporal attention pool + MLP classifier.
+            self.attn_pool = TemporalAttentionPool(
+                hidden_dim=hidden_dim,
+                num_heads=attn_heads,
+                dropout=attn_dropout,
+            )
+            self.head = nn.Sequential(
+                nn.Dropout(0.3),
+                nn.Linear(hidden_dim, 512),
+                nn.BatchNorm1d(512),
+                nn.GELU(),
+                nn.Dropout(0.2),
+                nn.Linear(512, self.num_train_classes),
+            )
+            self.sed_head = None
 
     def _compute_birdset_mel(self, x):
         """Waveform (B, T) -> normalized BirdSet mel image (B, 1, 256, time)."""
@@ -232,25 +253,47 @@ class BirdCLEFModel(nn.Module):
         return mel
 
     def _backbone_forward(self, mel):
-        """Run backbone and return attended features, attn weights, and optional BirdSet logits.
+        """Run backbone + head, returning a uniform per-chunk dict.
 
-        Returns:
-            pooled:           (B, C) attended feature vector
-            attn_weights:     (B, T_frames) attention weight per time frame
-            birdset_logits:   (B, birdset_dim) or None depending on backbone
+        Returns dict with:
+            all_logits:    (B, num_train_classes)        clip-level logits
+            latent:        (B, latent_dim)               feature vector
+            attn_weights:  (B, T_frames) or (B, T, num_train_classes)
+            frame_logits:  (B, T, num_train_classes) if head_type == sed_gru, else None
+            birdset_logits: (B, birdset_dim) or None
         """
         feat_map = self.backbone(mel)  # (B, C, H, W)
-        pooled, attn_weights = self.attn_pool(feat_map)
         birdset_logits = self.backbone.birdset_logits(feat_map) \
             if hasattr(self.backbone, "birdset_logits") else None
-        return pooled, attn_weights, birdset_logits
+
+        if self.head_type == "sed_gru":
+            sed_out = self.sed_head(feat_map)
+            return {
+                "all_logits": sed_out["clip_logits"],
+                "latent": sed_out["latent"],
+                "attn_weights": sed_out["attn_weights"],
+                "frame_logits": sed_out["frame_logits"],
+                "birdset_logits": birdset_logits,
+            }
+        else:
+            pooled, attn_weights = self.attn_pool(feat_map)  # (B, C), (B, T)
+            return {
+                "all_logits": self.head(pooled),
+                "latent": pooled,
+                "attn_weights": attn_weights,
+                "frame_logits": None,
+                "birdset_logits": birdset_logits,
+            }
 
     def forward_features(self, x, apply_spec_aug=False, return_mel=False):
-        """Extract attended features with optional waveform chunking.
+        """Run mel frontend + backbone + head, returning a per-chunk dict.
 
         Training: single random crop to bound GPU memory.
         Eval (short audio): single pass.
-        Eval (long audio): sliding window, average pooled features across chunks.
+        Eval (long audio): sliding window, average chunk outputs.
+
+        Returns dict with all_logits, latent, attn_weights, frame_logits,
+        birdset_logits, and (if return_mel) mel.
         """
         if x.dim() == 3 and x.shape[1] == 1:
             x = x[:, 0, :]
@@ -265,43 +308,53 @@ class BirdCLEFModel(nn.Module):
 
             mel_clean = self._compute_birdset_mel(x)
             mel = self._apply_spec_aug(mel_clean) if apply_spec_aug else mel_clean
-            pooled, attn_weights, birdset_logits = self._backbone_forward(mel)
+            out = self._backbone_forward(mel)
             if return_mel:
-                return pooled, attn_weights, birdset_logits, mel_clean
-            return pooled, attn_weights, birdset_logits
+                out["mel_clean"] = mel_clean
+            return out
 
         if x.shape[-1] <= max_wav_samples:
             mel = self._compute_birdset_mel(x)
-            pooled, attn_weights, birdset_logits = self._backbone_forward(mel)
+            out = self._backbone_forward(mel)
             if return_mel:
-                return pooled, attn_weights, birdset_logits, mel
-            return pooled, attn_weights, birdset_logits
+                out["mel_clean"] = mel
+            return out
 
-        # Sliding window -- average pooled features across chunks
-        pooled_sum = None
-        logits_sum = None
-        n_chunks = 0
+        # Sliding window: average per-chunk outputs.
         wav_len = x.shape[-1]
         wav_hop = self.chunk_hop_frames * self.hop_length
-
+        accum = None
+        n_chunks = 0
         for start in range(0, wav_len, wav_hop):
             end = min(start + max_wav_samples, wav_len)
             mel_chunk = self._compute_birdset_mel(x[..., start:end])
-            c_pooled, _, c_logits = self._backbone_forward(mel_chunk)
-            pooled_sum = c_pooled if pooled_sum is None else pooled_sum + c_pooled
-            if c_logits is not None:
-                logits_sum = c_logits if logits_sum is None else logits_sum + c_logits
+            chunk = self._backbone_forward(mel_chunk)
+            if accum is None:
+                accum = {k: (v.clone() if torch.is_tensor(v) else v)
+                         for k, v in chunk.items()}
+            else:
+                for k, v in chunk.items():
+                    if torch.is_tensor(v) and torch.is_tensor(accum.get(k)):
+                        # frame_logits varies in T across chunks; can't sum, drop it
+                        if accum[k].shape == v.shape:
+                            accum[k] = accum[k] + v
+                        else:
+                            accum[k] = None
             n_chunks += 1
             if end >= wav_len:
                 break
 
-        pooled = pooled_sum / max(n_chunks, 1)
-        birdset_logits = (logits_sum / max(n_chunks, 1)) if logits_sum is not None else None
-        # attn_weights not meaningful when averaging across chunks
-        attn_weights = torch.zeros(x.shape[0], 1, device=x.device)
+        out = {}
+        for k, v in accum.items():
+            if torch.is_tensor(v):
+                out[k] = v / max(n_chunks, 1)
+            else:
+                out[k] = v
+        # attn_weights are not meaningful when averaging across chunks
+        out["attn_weights"] = torch.zeros(x.shape[0], 1, device=x.device)
         if return_mel:
-            return pooled, attn_weights, birdset_logits, None
-        return pooled, attn_weights, birdset_logits
+            out["mel_clean"] = None
+        return out
 
     def forward(self, x, mixup_lambda=None, apply_spec_aug=None, return_mel=False):
         """
@@ -318,25 +371,23 @@ class BirdCLEFModel(nn.Module):
         fwd = self.forward_features(
             x, apply_spec_aug=apply_spec_aug, return_mel=return_mel,
         )
-        if return_mel:
-            pooled, attn_weights, student_birdset_logits, mel_clean = fwd
-        else:
-            pooled, attn_weights, student_birdset_logits = fwd
-            mel_clean = None
 
-        all_logits = self.head(pooled)
-
-        # Slice to target classes only for clipwise_output / logits
+        all_logits = fwd["all_logits"]
         target_logits = all_logits[:, :self.num_classes]
 
         output = {
             "clipwise_output": torch.sigmoid(target_logits),
             "logits": target_logits,
             "all_logits": all_logits,  # includes hard-negative classes
-            "latent_output": pooled,
-            "student_birdset_logits": student_birdset_logits,
-            "attn_weights": attn_weights,
+            "latent_output": fwd["latent"],
+            "student_birdset_logits": fwd["birdset_logits"],
+            "attn_weights": fwd["attn_weights"],
         }
-        if mel_clean is not None:
-            output["mel_for_teacher"] = mel_clean
+        # SED head also produces frame-level logits — expose for downstream use.
+        if fwd.get("frame_logits") is not None:
+            frame_all = fwd["frame_logits"]
+            output["frame_logits"] = frame_all[..., :self.num_classes]
+            output["frame_all_logits"] = frame_all
+        if return_mel and fwd.get("mel_clean") is not None:
+            output["mel_for_teacher"] = fwd["mel_clean"]
         return output

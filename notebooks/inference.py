@@ -139,6 +139,16 @@ def _remap_legacy_keys(state_dict):
     return out
 
 
+def _detect_head(state_dict, ckpt_path):
+    """Detect head type. SED head has 'sed_head.*' keys; otherwise attn_clip."""
+    if any(k.startswith("sed_head.") for k in state_dict):
+        return "sed_gru"
+    fname = os.path.basename(ckpt_path).lower()
+    if "sed_gru" in fname or "sedgru" in fname:
+        return "sed_gru"
+    return "attn_clip"
+
+
 def load_model(checkpoint_path):
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state_dict = ckpt["state_dict"]
@@ -148,29 +158,48 @@ def load_model(checkpoint_path):
     model_dict = _remap_legacy_keys(model_dict)
 
     backbone = _detect_backbone(model_dict, checkpoint_path)
+    head_type = _detect_head(model_dict, checkpoint_path)
 
     # Detect if checkpoint was trained with hard-negative extra classes
-    # by checking the final head layer output size
-    head_weight_key = "head.5.weight"
+    # by checking the final head layer output size.
+    # attn_clip:  head.5.weight    (last Linear of MLP head, shape (num_train_classes, 512))
+    # sed_gru:    sed_head.attn_pool.cla.weight (shape (num_train_classes, 2*gru_hidden))
     num_train_classes = NUM_CLASSES
-    if head_weight_key in model_dict:
-        ckpt_out_classes = model_dict[head_weight_key].shape[0]
-        if ckpt_out_classes > NUM_CLASSES:
-            num_train_classes = ckpt_out_classes
-            print(f"  Checkpoint has {ckpt_out_classes} train classes "
-                  f"(target: {NUM_CLASSES}, extra: {ckpt_out_classes - NUM_CLASSES})")
+    if head_type == "sed_gru" and "sed_head.attn_pool.cla.weight" in model_dict:
+        ckpt_out_classes = model_dict["sed_head.attn_pool.cla.weight"].shape[0]
+    elif "head.5.weight" in model_dict:
+        ckpt_out_classes = model_dict["head.5.weight"].shape[0]
+    else:
+        ckpt_out_classes = NUM_CLASSES
+    if ckpt_out_classes > NUM_CLASSES:
+        num_train_classes = ckpt_out_classes
+        print(f"  Checkpoint has {ckpt_out_classes} train classes "
+              f"(target: {NUM_CLASSES}, extra: {ckpt_out_classes - NUM_CLASSES})")
+
+    # SED head needs gru_hidden inferred from the GRU weight shape.
+    gru_hidden = 256
+    if head_type == "sed_gru":
+        # GRU input-to-hidden weight has shape (3 * 2 * hidden, in_channels) for biGRU
+        # PyTorch stores per-direction weights separately:
+        # weight_ih_l0 has shape (3*hidden, in_channels), and there's _reverse for the second direction
+        w_ih = model_dict.get("sed_head.gru.weight_ih_l0")
+        if w_ih is not None:
+            gru_hidden = w_ih.shape[0] // 3
 
     model = BirdCLEFModel(
         num_classes=NUM_CLASSES,
         num_train_classes=num_train_classes,
         sample_rate=SAMPLE_RATE,
         backbone_name=backbone,
+        head_type=head_type,
+        gru_hidden=gru_hidden,
         pretrained=False,
     )
     missing, unexpected = model.load_state_dict(model_dict, strict=True)
     assert not missing, f"Missing keys loading {os.path.basename(checkpoint_path)}: {missing}"
     model.eval()
-    print(f"  Loaded {os.path.basename(checkpoint_path)} (backbone={backbone})")
+    print(f"  Loaded {os.path.basename(checkpoint_path)} "
+          f"(backbone={backbone}, head={head_type})")
     return model
 
 

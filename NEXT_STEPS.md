@@ -1,10 +1,12 @@
 # BirdCLEF 2026 — Next Steps
 
-## Current status (2026-04-27)
-- **Single-B1 baseline**: val_macro_auc 0.9686 (job 358438), Kaggle LB **0.871**.
+## Current status (2026-04-29)
+- **Single-B1 baseline (job 358438)**: val_macro_auc 0.9686, Kaggle LB **0.871**.
 - **Single-model self-training: failed 5 distinct ways.** Hard labels, soft logits + KL, warm-start at lr=2e-4, distribution-match + power-T + cross-domain MixUp at lr=2e-5, multi-iteration loop. All degrade val_auc 1-3pp; iteration *compounds* the regression.
-- **Diagnosis**: single B1 teacher is miscalibrated on Pantanal soundscapes (frog detections dominate). Each pseudo-label round amplifies that bias.
-- **Now running (job 369185)**: 4-backbone ensemble baseline (efficientnet_b0, mobilenetv3_small, resnet18, convnext_tiny on folds 0-3). New code: `src/backbones.py`, `scripts/ensemble_pipeline.sh`. First model finished at val_auc 0.9443 (~2.4pp below B1 due to no bird-domain pretraining).
+- **Round-1 ensemble (job 369185, B0/MNet-Small/ResNet18/ConvNeXt-Tiny)**: ConvNeXt diverged at LR=1.5e-4. Other 3 ensembled to Kaggle LB **0.865** (-0.6pp vs single B1 — ensembling weaker members dragged down the strong member).
+- **Round-2 ensemble (job 371473, B1/B0/MNet-Large/RegNetY-002 with `bg_mix_prob=0.5`)**: 4 baselines + 3 of 4 iter-1 cross-pollinated retrains finished before SLURM timeout. Round-2 B1 regressed to 0.9402 (likely too-aggressive bg_mix). Cross-pollinated retrain (iter 1) regressed all members 0.6-1.2pp.
+- **Diagnosis (provisional)**: warm-start instability + possibly per-class calibration (frog over-detection observed in job 361371 but not yet re-verified with new ensemble). Both hypotheses still need testing.
+- **Now**: SED head (`src/sed.py`) is wired and tested locally; can launch via `HEAD=sed_gru sbatch scripts/ensemble_pipeline.sh`.
 - **Gap to 1st place**: 0.93 vs 0.87 on '25 LB equivalent.
 
 ## Key problem: domain shift
@@ -41,17 +43,50 @@ Backbone-agnostic: every backbone produces (B, C, H, W) with W = time. Mean-pool
 - [ ] **Train one ensemble member with SED head** as the comparison. Compare val_macro_auc and especially worst-class-AUC vs attn-pool head.
 - [ ] **30s window training** — once SED head works, retrain with 30s windows so the GRU sees real temporal context. Bigger refactor (dataloader chunking, loss, inference).
 
-### 4. Tune ensemble pseudo-label hyperparameters (only after Tier-1 #1 improves baseline)
-- [ ] **Tune `PSEUDO_POWER_T`** — sweep T ∈ {1.5, 2.0, 3.0, 4.0}. Babych tuned against LB feedback.
-- [ ] **Tune `PSEUDO_MIXUP_ALPHA`** — try 0.2, 0.4, 0.6.
-- [ ] **Tune `THRESHOLD`** — pseudo-label confidence cutoff.
-- [ ] **Tune `RETRAIN_LR`** — currently 2e-5 for warm-start.
-- [ ] **Pseudo-label stability filter** — track per-segment prediction stability across iterations; drop samples where predictions flip-flop.
+#### Alternative: 2D attention head (Conformer/Spectral-Attention style)
+Instead of biGRU on the time axis (or dual-axis GRU on freq + time), use a small transformer block that does cross-attention between time queries and freq keys/values. More expressive than dual-GRU, similar compute, and well-supported by audio literature (Conformer, Spectral Attention papers).
+
+```
+(B, C, H, W) → permute (B, H*W, C) → Transformer block (1-2 layers) → (B, H*W, C)
+            → split back to (B, H, W, C) → time-axis attn pool → (B, num_classes)
+```
+
+- [ ] **Add `attn_2d` head option** — single transformer block with self-attention across the flattened (H, W) feature map. Cheap (8 freq × 20 time = 160-token sequence is small). Compare against `sed_gru`.
+- [ ] **Conformer-style block** — convolution + self-attention combined. More principled for audio. Requires writing a small Conformer block but well-defined recipe.
+- [ ] **Note**: only worth doing AFTER `sed_gru` is shown to help. If the GRU adds nothing, freq+time attention probably won't either.
+
+### 4. Tune pseudo-label hyperparameters (with OOF feedback signal)
+We have several pseudo-label knobs (`PSEUDO_POWER_T`, `PSEUDO_MIXUP_ALPHA`, `THRESHOLD`, `RETRAIN_LR`) but never tuned them with a real feedback loop. Combined with the new OOF eval (#2), small grid sweeps now give trustworthy comparison signals without burning Kaggle submissions.
+
+- [ ] **Per-class adaptive thresholds (A2)** — replace global `--threshold 0.8` with per-class quantile or distribution-calibrated cutoffs. Three options ranked by complexity:
+  - Quantile-based: keep top X% of segments per class (cheap, naturally rebalances)
+  - Confidence-distribution percentile: per-class threshold so each class keeps its top-N percentile
+  - **OOF-calibrated**: fit per-class probability calibration (Platt or isotonic) on OOF predictions over labeled data, then apply global threshold to calibrated probs
+  - **Diagnostic first**: before tuning thresholds, log per-species pseudo-label counts and compare to training distribution. Frog over-detection has been observed in one run (job 361371) but never rechecked with the new ensemble — verify it's still the issue before optimizing for it.
+- [ ] **Hyperparameter grid sweep (A3)** — small grids on `PSEUDO_POWER_T ∈ {1.5, 2.0, 3.0}`, `THRESHOLD ∈ {0.6, 0.75, 0.85}`, `PSEUDO_MIXUP_ALPHA ∈ {0.0, 0.2, 0.4}`. Each combination is one retrain (~3-4h). Use OOF macro-AUC (#2) as comparison metric, not val (which doesn't track LB well).
+- [ ] **Pseudo-label stability filter** — track per-segment prediction stability across iterations; drop samples where predictions flip-flop. Free signal from existing logits.
+- [ ] **Per-species count audit** — write a small util that prints pseudo-label distribution vs training distribution per species. Run after each pseudo-label generation. Lets us verify (or falsify) the frog-bias hypothesis without guessing.
 
 ### 5. Pseudo-label our own train soundscapes
 Babych pseudo-labels train soundscapes too, not just external unlabeled data. Adds free domain-matched data with reliable signal.
 
 - [ ] **Extend `scripts/pseudo_label.py` to predict on `train_soundscapes/`** — filter out chunks overlapping labeled regions.
+
+### 6. Tighter back-and-forth training/pseudolabeling loops
+The current pipeline regenerates pseudo-labels only between full retrains (every ~3-4h). Two ways to tighten the loop so pseudo-labels improve as the model improves:
+
+- [ ] **Inner-loop pseudo-label refresh (B3)** — every N epochs during training, regenerate pseudo-labels using the *current* student checkpoint (no separate teacher). Replaces stale labels mid-run. Cheaper than EMA (no shadow model), less principled (uses student's own predictions to teach itself — risk of confirmation bias) but easy to implement: ~50 lines in train.py, hook into `on_train_epoch_end`.
+- [ ] **EMA Mean Teacher** — maintain a teacher copy whose weights are an exponential moving average of student weights. Each batch, teacher pseudo-labels unlabeled audio in real-time; student trains against those labels with a consistency loss. Tarvainen & Valpola 2017 / FixMatch. Teacher is always more recent than any frozen-snapshot teacher, AND lags student enough to be stable. Probably the most likely thing to break the calibration plateau if the cross-pollinated ensemble keeps regressing.
+- [ ] **Reservoir of pseudo-labels with rolling refresh** — maintain a buffer of pseudo-labeled samples; periodically replace lowest-confidence (or most stale) entries. Keeps training distribution stable while gradually upgrading label quality.
+
+### 7. Gradient-based augmentation/pseudo-label parameter updates
+Hyperparameter optimization where the parameters update via gradient signals rather than grid search. Real research direction, modest expected ROI for this competition (most aug levers are 0.5-1pp territory), but interesting if we hit a plateau on simpler approaches.
+
+- [ ] **Learned per-sample MixUp `λ` (AdaMixup-style)** — small MLP looks at (clip_a, clip_b) features and predicts the mixing weight. Trainable end-to-end via the supervised loss; backbone-agnostic. ~50 lines.
+- [ ] **Saliency-driven MixUp (Puzzle-Mix style)** — use the model's own attention weights from `TemporalAttentionPool` to bias mixing toward bird-on-bird overlap (not bird-on-silence). Differentiable through attention. Probably 100 lines.
+- [ ] **Differentiable SpecAugment via Gumbel-softmax** — make discrete masking choices differentiable so the model can learn where/how aggressively to mask. More academic, less likely to pay off than the saliency idea above.
+- [ ] **Bilevel optimization on `mixup_alpha` / `bg_mix_prob`** — outer loop optimizes augmentation hyperparameters using OOF gradient. Theoretically clean, 2-5× compute cost. Probably not worth it unless grid search has truly stalled.
+- [ ] **Learned per-class pseudo-label thresholds** — instead of fixed `THRESHOLD=0.8`, treat the per-class threshold as a learnable parameter optimized against OOF macro-AUC. Differentiable surrogate for the (non-differentiable) threshold step. Subtle but plausible.
 
 ### 6. Audio quality as a training signal
 `train.csv` has `rating` column (0-5). Focal recordings rated 5 are clean; rating 0 are noisy unrated iNat.

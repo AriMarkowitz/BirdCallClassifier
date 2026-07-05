@@ -1,17 +1,23 @@
 """
-Fine-tune BirdSet EfficientNet on BirdCLEF 2026 for multi-label classification.
+Fine-tune HTSAT on BirdCLEF 2026 for multi-label classification.
 
-Key features:
-  - BirdSet EfficientNet-B1 backbone via Hugging Face
-  - Variable-length/full-file audio input (default) padded per batch
-  - Teacher-student distillation to reduce overfitting under domain shift
-  - Moderate SuMix + focal/BCE loss + class-balanced sampling
+Usage:
+    python src/train.py --checkpoint path/to/HTSAT_AudioSet_Saved.ckpt
+
+Key adjustments from AudioSet defaults:
+  - classes_num: 234 (from taxonomy.csv)
+  - Warmup reduced: 1 epoch at 0.1x LR, then cosine decay
+  - Lower LR: 3e-5 default (fine-tuning, not training from scratch)
+  - Batch size: 32 (single GPU default)
+  - Site-based validation split for realistic eval
+  - WeightedRandomSampler to upweight soundscape data
 """
 
 import os
 import sys
 import argparse
 import logging
+import math
 
 import numpy as np
 import torch
@@ -19,312 +25,201 @@ import torch.nn as nn
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 
+# Add HTSAT source to path
 PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(PROJ_ROOT, "external", "htsat"))
 sys.path.insert(0, os.path.join(PROJ_ROOT, "src"))
 
-from model import BirdCLEFModel
-from dataset import get_dataloaders, build_label_map
+import config as htsat_config
+from model.htsat import HTSAT_Swin_Transformer
+from sed_model import SEDWrapper
+from torch.utils.data import DataLoader
+from dataset import get_dataloaders, get_datasets, build_label_map
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 class FocalLoss(nn.Module):
-    """Binary focal loss on logits for multi-label classification."""
+    """Binary focal loss for multi-label classification.
+
+    Focuses training on hard examples by down-weighting easy negatives.
+    With gamma=0 this is equivalent to standard BCE.
+
+    Args:
+        alpha: Weighting factor for positives (1-alpha for negatives).
+        gamma: Focusing parameter — higher values down-weight easy examples more.
+    """
 
     def __init__(self, alpha: float = 0.25, gamma: float = 2.0):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
 
-    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        bce = nn.functional.binary_cross_entropy_with_logits(
-            logits, target, reduction="none"
-        )
-        prob = torch.sigmoid(logits)
-        pt = torch.where(target >= 0.5, prob, 1.0 - prob)
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        bce = nn.functional.binary_cross_entropy(pred, target, reduction="none")
+        pt = torch.where(target >= 0.5, pred, 1.0 - pred)
         alpha_t = torch.where(target >= 0.5, self.alpha, 1.0 - self.alpha)
         focal_weight = alpha_t * (1.0 - pt) ** self.gamma
         return (focal_weight * bce).mean()
 
 
-class BirdCLEFWrapper(pl.LightningModule):
-    """Lightning wrapper with supervised loss + optional distillation."""
+def load_pretrained_htsat(checkpoint_path, config, num_classes):
+    """
+    Load an AudioSet-pretrained HTSAT checkpoint and replace the
+    classification head for `num_classes`.
+    """
+    # Build model with original 527 classes to load weights
+    model_527 = HTSAT_Swin_Transformer(
+        spec_size=config.htsat_spec_size,
+        patch_size=config.htsat_patch_size,
+        patch_stride=config.htsat_stride,
+        num_classes=527,
+        embed_dim=config.htsat_dim,
+        depths=config.htsat_depth,
+        num_heads=config.htsat_num_head,
+        window_size=config.htsat_window_size,
+        config=config,
+    )
 
-    def __init__(
-        self,
-        model,
-        num_classes,
-        learning_rate=1e-4,
-        max_epochs=40,
-        loss_type="bce",
-        focal_alpha=0.25,
-        focal_gamma=2.0,
-        mixup_alpha=0.0,
-        distill_weight=0.0,
-        distill_temperature=2.0,
-        teacher_model=None,
-        idx_to_label=None,
-        pseudo_distill_weight=1.0,
-        pseudo_mixup_alpha=0.0,
-    ):
+    if checkpoint_path and os.path.isfile(checkpoint_path):
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        if "state_dict" in ckpt:
+            state_dict = ckpt["state_dict"]
+            state_dict = {
+                k.replace("sed_model.", ""): v
+                for k, v in state_dict.items()
+            }
+        else:
+            state_dict = ckpt
+
+        filtered = {
+            k: v for k, v in state_dict.items()
+            if "head" not in k and "tscam_conv" not in k and "nmf_proj" not in k
+        }
+        missing, unexpected = model_527.load_state_dict(filtered, strict=False)
+        logger.info(f"Loaded pretrained weights. Missing: {len(missing)}, "
+                    f"Unexpected: {len(unexpected)}")
+    else:
+        logger.warning("No checkpoint provided — training from scratch.")
+
+    # Rebuild with correct num_classes
+    model = HTSAT_Swin_Transformer(
+        spec_size=config.htsat_spec_size,
+        patch_size=config.htsat_patch_size,
+        patch_stride=config.htsat_stride,
+        num_classes=num_classes,
+        embed_dim=config.htsat_dim,
+        depths=config.htsat_depth,
+        num_heads=config.htsat_num_head,
+        window_size=config.htsat_window_size,
+        config=config,
+    )
+
+    # Copy backbone weights
+    src_dict = model_527.state_dict()
+    tgt_dict = model.state_dict()
+    for k in tgt_dict:
+        if "head" not in k and "tscam_conv" not in k and "nmf_proj" not in k and k in src_dict:
+            tgt_dict[k] = src_dict[k]
+    model.load_state_dict(tgt_dict)
+    logger.info(f"Head replaced: 527 -> {num_classes} classes")
+
+    return model
+
+
+class BirdCLEFWrapper(pl.LightningModule):
+    """Lightning wrapper for HTSAT fine-tuning on BirdCLEF."""
+
+    def __init__(self, sed_model, config, num_classes, learning_rate=1e-4,
+                 warmup_epochs=1, max_epochs=30,
+                 loss_type="bce", focal_alpha=0.25, focal_gamma=2.0,
+                 mixup_alpha=0.4, idx_to_label=None):
         super().__init__()
-        self.model = model
+        self.sed_model = sed_model
+        self.config = config
         self.num_classes = num_classes
         self.learning_rate = learning_rate
+        self.warmup_epochs = warmup_epochs
         self.max_epochs = max_epochs
         self.mixup_alpha = mixup_alpha
-        self.distill_weight = distill_weight
-        self.distill_temperature = distill_temperature
-        self.teacher_model = teacher_model
         self.idx_to_label = idx_to_label or {}
-        self.pseudo_distill_weight = pseudo_distill_weight
-        self.pseudo_mixup_alpha = pseudo_mixup_alpha
-
         if loss_type == "focal":
             self.loss_fn = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
             logger.info(f"Using FocalLoss (alpha={focal_alpha}, gamma={focal_gamma})")
         else:
-            self.loss_fn = nn.BCEWithLogitsLoss()
-            logger.info("Using BCEWithLogitsLoss")
-
+            self.loss_fn = nn.BCELoss()
+            logger.info("Using BCELoss")
         if mixup_alpha > 0:
             logger.info(f"SuMix enabled: alpha={mixup_alpha}")
-        if teacher_model is not None and distill_weight > 0:
-            logger.info(
-                f"Distillation enabled: weight={distill_weight}, "
-                f"temperature={distill_temperature}"
-            )
 
-    def forward(self, x):
-        return self.model(x)["clipwise_output"]
+    def forward(self, x, mix_lambda=None):
+        output_dict = self.sed_model(x, mix_lambda)
+        clipwise = output_dict["clipwise_output"]  # already sigmoided
+        return clipwise, output_dict["framewise_output"]
 
-    def _safe_supervised_loss(self, logits, target):
+    def _safe_loss(self, pred, target):
+        """Clamp predictions to [eps, 1-eps] and compute BCE in fp32."""
         with torch.amp.autocast("cuda", enabled=False):
-            logits = logits.float()
-            logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0)
-            target = torch.nan_to_num(target.float(), nan=0.0, posinf=1.0, neginf=0.0)
-            target = target.clamp(0.0, 1.0)
-            return self.loss_fn(logits, target)
-
-    def _current_distill_weight(self):
-        """Cosine decay: full distill_weight at epoch 0, tapering to 0 by final epoch."""
-        progress = self.current_epoch / max(self.max_epochs - 1, 1)
-        return self.distill_weight * 0.5 * (1.0 + np.cos(np.pi * progress))
-
-    def _distill_loss(self, student_logits, teacher_logits):
-        """KL-divergence distillation with temperature-scaled softmax.
-
-        Softmax over the BirdSet class dimension is more principled than
-        independent sigmoids: it captures relative confidence across all
-        ~9.7K BirdSet species rather than treating each as independent.
-        """
-        t = float(self.distill_temperature)
-        with torch.amp.autocast("cuda", enabled=False):
-            s = torch.nan_to_num(student_logits.float(), nan=0.0, posinf=20.0, neginf=-20.0)
-            te = torch.nan_to_num(teacher_logits.float(), nan=0.0, posinf=20.0, neginf=-20.0)
-            student_log_prob = nn.functional.log_softmax(s / t, dim=-1)
-            teacher_prob = nn.functional.softmax(te / t, dim=-1)
-            # KL(teacher || student), scaled by T^2 to keep gradient magnitude
-            # consistent across temperature values (Hinton et al. 2015)
-            return (t * t) * nn.functional.kl_div(
-                student_log_prob, teacher_prob, reduction="batchmean",
-            )
-
-    def _pseudo_distill_loss(self, student_logits, teacher_logits, mask):
-        """Per-sample binary KL divergence between student and teacher logits.
-
-        For multi-label classification, we treat each class as an independent
-        Bernoulli and compute KL(teacher || student) per class, then average.
-        This is more appropriate than softmax KL since multiple species can
-        be present simultaneously.
-
-        Only applied to samples where mask=1 (i.e., pseudo-labeled samples).
-        """
-        with torch.amp.autocast("cuda", enabled=False):
-            s = torch.nan_to_num(student_logits.float(), nan=0.0, posinf=20.0, neginf=-20.0)
-            t = torch.nan_to_num(teacher_logits.float(), nan=0.0, posinf=20.0, neginf=-20.0)
-            mask = mask.float()
-
-            if mask.sum() == 0:
-                return torch.tensor(0.0, device=student_logits.device)
-
-            # Bernoulli KL: KL(p_t || p_s) for each class independently
-            # p_t = sigmoid(t), p_s = sigmoid(s)
-            # KL = p_t * log(p_t/p_s) + (1-p_t) * log((1-p_t)/(1-p_s))
-            # = p_t * (log_sigmoid(t) - log_sigmoid(s))
-            #   + (1-p_t) * (log_sigmoid(-t) - log_sigmoid(-s))
-            log_s_pos = torch.nn.functional.logsigmoid(s)
-            log_s_neg = torch.nn.functional.logsigmoid(-s)
-            log_t_pos = torch.nn.functional.logsigmoid(t)
-            log_t_neg = torch.nn.functional.logsigmoid(-t)
-
-            p_t = torch.sigmoid(t)
-            kl = p_t * (log_t_pos - log_s_pos) + (1.0 - p_t) * (log_t_neg - log_s_neg)
-            # kl shape: (B, C), all non-negative
-
-            # Mean over classes, then masked mean over batch
-            per_sample = kl.mean(dim=-1)  # (B,)
-            return (per_sample * mask).sum() / mask.sum()
+            pred = pred.float().clamp(1e-6, 1.0 - 1e-6)
+            target = target.float()
+            return self.loss_fn(pred, target)
 
     def _sumix(self, waveform, target):
-        """Additive waveform mixing with soft target max-merge."""
+        """SuMix: shuffle batch and mix waveforms additively with soft labels.
+
+        Waveform: anchor + (1-lam) * shuffled (additive, not convex).
+        Target: element-wise max of (anchor_target, (1-lam) * shuffled_target).
+        This ensures the anchor labels stay at full strength while the secondary
+        labels are scaled by their actual gain — a species mixed at 10% gain
+        gets a 0.1 target, not 1.0.
+        """
         if self.mixup_alpha <= 0:
             return waveform, target
 
         lam = np.random.beta(self.mixup_alpha, self.mixup_alpha)
-        lam = max(lam, 1.0 - lam)
+        lam = max(lam, 1.0 - lam)  # ensure anchor dominates
 
         batch_size = waveform.size(0)
         perm = torch.randperm(batch_size, device=waveform.device)
 
-        waveform_mixed = lam * waveform + (1.0 - lam) * waveform[perm]
+        # Additive waveform mix: anchor stays at full gain, secondary scaled
+        waveform_mixed = waveform + (1.0 - lam) * waveform[perm]
+        # Anchor labels stay at full strength; secondary labels scaled by
+        # their mixing gain so the target reflects actual audibility
         target_mixed = torch.maximum(target, (1.0 - lam) * target[perm])
+
         return waveform_mixed, target_mixed
-
-    def _cross_domain_mixup(self, waveform, target, teacher_logits, teacher_mask):
-        """MixUp between pseudo-labeled soundscape chunks and labeled focal samples.
-
-        For each pseudo sample (mask=1), find a labeled partner (mask=0) and mix.
-        Bridges the focal↔soundscape domain gap directly in input space
-        (Babych BirdCLEF'25 1st-place self-training loop).
-
-        After mixing:
-          - waveform = λ·pseudo + (1-λ)·labeled
-          - target   = λ·pseudo_soft + (1-λ)·labeled_hard  (linear interp)
-          - teacher_mask is scaled by λ so the KL loss only counts the
-            pseudo fraction of each mixed sample.
-        """
-        if self.pseudo_mixup_alpha <= 0 or teacher_mask.sum() == 0:
-            return waveform, target, teacher_logits, teacher_mask
-
-        device = waveform.device
-        is_pseudo = teacher_mask > 0.5
-        is_labeled = ~is_pseudo
-        if is_labeled.sum() == 0:
-            return waveform, target, teacher_logits, teacher_mask
-
-        labeled_indices = torch.nonzero(is_labeled, as_tuple=False).squeeze(-1)
-        pseudo_indices = torch.nonzero(is_pseudo, as_tuple=False).squeeze(-1)
-
-        # Sample λ per pseudo sample. Skew toward higher λ so pseudo content
-        # dominates the mix (we still want the teacher signal to drive learning).
-        lam_np = np.random.beta(self.pseudo_mixup_alpha, self.pseudo_mixup_alpha,
-                                size=pseudo_indices.numel())
-        lam_np = np.maximum(lam_np, 1.0 - lam_np)
-        lam = torch.from_numpy(lam_np).float().to(device)
-
-        # Random labeled partner for each pseudo sample (with replacement).
-        partner_pos = torch.randint(0, labeled_indices.numel(),
-                                    (pseudo_indices.numel(),), device=device)
-        partners = labeled_indices[partner_pos]
-
-        # Mix in waveform and target space.
-        lam_w = lam.view(-1, 1)
-        lam_t = lam.view(-1, 1)
-        new_wave = waveform.clone()
-        new_target = target.clone()
-        new_wave[pseudo_indices] = (
-            lam_w * waveform[pseudo_indices]
-            + (1.0 - lam_w) * waveform[partners]
-        )
-        new_target[pseudo_indices] = (
-            lam_t * target[pseudo_indices]
-            + (1.0 - lam_t) * target[partners]
-        )
-
-        # Down-weight the teacher KL contribution by λ for mixed samples.
-        new_mask = teacher_mask.clone()
-        new_mask[pseudo_indices] = lam
-        return new_wave, new_target, teacher_logits, new_mask
 
     def training_step(self, batch, batch_idx):
         waveform = batch["waveform"]
         target = batch["target"]
-        distill_active = self.teacher_model is not None and self.distill_weight > 0
 
-        # Cross-domain MixUp first (operates on full batch incl. pseudo).
-        teacher_logits_pl = batch.get("teacher_logits")
-        teacher_mask = batch.get("teacher_logits_mask")
-        if (self.training and self.pseudo_mixup_alpha > 0
-                and teacher_logits_pl is not None and teacher_mask is not None):
-            waveform, target, teacher_logits_pl, teacher_mask = self._cross_domain_mixup(
-                waveform, target, teacher_logits_pl, teacher_mask,
-            )
-
+        # Apply SuMix batch-level augmentation
         if self.training and self.mixup_alpha > 0:
             waveform, target = self._sumix(waveform, target)
 
-        output_dict = self.model(
-            waveform,
-            apply_spec_aug=self.training,
-            return_mel=distill_active,
-        )
-        # Use all_logits (includes hard-negative classes) for training loss
-        all_logits = output_dict["all_logits"]
-        supervised_loss = self._safe_supervised_loss(all_logits, target)
-
-        total_loss = supervised_loss
-        distill_loss = torch.tensor(0.0, device=waveform.device)
-        pseudo_distill_loss = torch.tensor(0.0, device=waveform.device)
-
-        if distill_active:
-            # Reuse the same (clean) mel chunk the student used (no extra STFT)
-            mel_clean = output_dict["mel_for_teacher"]
-            student_logits = output_dict["student_birdset_logits"]
-            with torch.no_grad():
-                teacher_logits = self.teacher_model(pixel_values=mel_clean).logits
-            distill_loss = self._distill_loss(student_logits, teacher_logits)
-            dw = self._current_distill_weight()
-            if torch.isfinite(distill_loss):
-                total_loss = supervised_loss + dw * distill_loss
-            else:
-                logger.warning(f"Step {self.global_step}: distill_loss is NaN/Inf, using supervised only")
-                distill_loss = torch.tensor(0.0, device=waveform.device)
-                total_loss = supervised_loss
-
-        # Pseudo-label distillation: match teacher logits on pseudo-labeled samples
-        if teacher_logits_pl is not None and self.pseudo_distill_weight > 0:
-            if teacher_mask.sum() > 0:
-                # Student logits on target classes (same shape as teacher logits)
-                student_logits_target = output_dict["logits"]
-                pseudo_distill_loss = self._pseudo_distill_loss(
-                    student_logits_target, teacher_logits_pl, teacher_mask)
-                if torch.isfinite(pseudo_distill_loss):
-                    total_loss = total_loss + self.pseudo_distill_weight * pseudo_distill_loss
-                else:
-                    logger.warning(f"Step {self.global_step}: pseudo_distill_loss is NaN/Inf, skipping")
-                    pseudo_distill_loss = torch.tensor(0.0, device=waveform.device)
-
-        self.log("train_loss", total_loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log("train_supervised_loss", supervised_loss, on_step=True, on_epoch=True)
-        if self.teacher_model is not None and self.distill_weight > 0:
-            self.log("train_distill_loss", distill_loss, on_step=True, on_epoch=True)
-            self.log("distill_weight_current", self._current_distill_weight(), on_step=False, on_epoch=True)
-        if "teacher_logits" in batch:
-            self.log("train_pseudo_distill_loss", pseudo_distill_loss, on_step=True, on_epoch=True)
-
+        pred, _ = self(waveform)
+        loss = self._safe_loss(pred, target)
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         if batch_idx % 50 == 0:
-            logger.info(
-                f"Step {self.global_step} (epoch {self.current_epoch}, "
-                f"batch {batch_idx}): train_loss={total_loss.item():.4f}"
-            )
-        return total_loss
+            logger.info(f"Step {self.global_step} (epoch {self.current_epoch}, "
+                        f"batch {batch_idx}): train_loss={loss.item():.4f}")
+        return loss
 
     def validation_step(self, batch, batch_idx):
-        output_dict = self.model(batch["waveform"], apply_spec_aug=False)
-        pred = output_dict["clipwise_output"]
-        logits = output_dict["logits"]
-        loss = self._safe_supervised_loss(logits, batch["target"])
+        pred, _ = self(batch["waveform"])
+        loss = self._safe_loss(pred, batch["target"])
         self.log("val_loss", loss, on_epoch=True, prog_bar=True)
-
+        # Accumulate for epoch-end AUC computation
         if not hasattr(self, "_val_preds"):
             self._val_preds = []
             self._val_targets = []
-        self._val_preds.append(pred.detach().float().cpu())
-        self._val_targets.append(batch["target"].detach().float().cpu())
+        self._val_preds.append(pred.detach().cpu())
+        self._val_targets.append(batch["target"].detach().cpu())
 
     def on_validation_epoch_end(self):
+        import numpy as np
         from sklearn.metrics import roc_auc_score
 
         if not hasattr(self, "_val_preds") or len(self._val_preds) == 0:
@@ -335,6 +230,7 @@ class BirdCLEFWrapper(pl.LightningModule):
         self._val_preds.clear()
         self._val_targets.clear()
 
+        # Per-class AUC (only for classes with positive samples in val)
         per_class_auc = {}
         col_mask = targets.sum(axis=0) > 0
         for i in range(self.num_classes):
@@ -347,6 +243,7 @@ class BirdCLEFWrapper(pl.LightningModule):
             except Exception:
                 pass
 
+        # Macro AUC
         try:
             if col_mask.any():
                 macro_auc = roc_auc_score(
@@ -359,20 +256,41 @@ class BirdCLEFWrapper(pl.LightningModule):
 
         self.log("val_macro_auc", macro_auc, prog_bar=True)
         self.log("val_n_evaluable_classes", float(len(per_class_auc)))
-        logger.info(
-            f"Epoch {self.current_epoch}: val_macro_auc={macro_auc:.4f} "
-            f"({len(per_class_auc)} evaluable classes)"
-        )
+        logger.info(f"Epoch {self.current_epoch}: val_macro_auc={macro_auc:.4f} "
+                     f"({len(per_class_auc)} evaluable classes)")
 
+        # Log top-10 best and worst per-class AUCs
         if per_class_auc:
             sorted_aucs = sorted(per_class_auc.items(), key=lambda x: x[1])
             worst10 = sorted_aucs[:10]
             best10 = sorted_aucs[-10:]
-            logger.info("  Worst 10 AUC: " + ", ".join(f"{sp}={auc:.3f}" for sp, auc in worst10))
-            logger.info("  Best 10 AUC: " + ", ".join(f"{sp}={auc:.3f}" for sp, auc in best10))
+
+            logger.info(f"  Worst 10 AUC: " +
+                         ", ".join(f"{sp}={auc:.3f}" for sp, auc in worst10))
+            logger.info(f"  Best 10 AUC: " +
+                         ", ".join(f"{sp}={auc:.3f}" for sp, auc in best10))
+
+            # Store for W&B (logged via self.logger if available)
+            if self.logger and hasattr(self.logger, "experiment"):
+                try:
+                    import wandb
+                    # Log worst/best as a summary table each epoch
+                    table = wandb.Table(columns=["species", "auc", "rank"])
+                    for rank, (sp, auc) in enumerate(sorted_aucs):
+                        table.add_data(sp, round(auc, 4), rank + 1)
+                    self.logger.experiment.log({
+                        "val/per_class_auc_table": table,
+                        "val/worst_class_auc": worst10[0][1],
+                        "val/best_class_auc": best10[-1][1],
+                        "val/median_class_auc": float(np.median(
+                            [v for v in per_class_auc.values()])),
+                    })
+                except Exception:
+                    pass  # W&B not available or not configured
 
     def configure_optimizers(self):
         params = filter(lambda p: p.requires_grad, self.parameters())
+
         optimizer = torch.optim.AdamW(
             params,
             lr=self.learning_rate,
@@ -381,171 +299,110 @@ class BirdCLEFWrapper(pl.LightningModule):
             weight_decay=0.05,
         )
 
-        is_warmstart = hasattr(self, "_warmstart") and self._warmstart
-
-        if is_warmstart:
-            # Warm-start: fresh optimizer (don't restore stale momentum),
-            # cosine decay only — no warmup since weights are already good.
-            logger.info(f"  Warm-start LR schedule: cosine decay from {self.learning_rate} "
-                        f"over {self.max_epochs} epochs (no warmup)")
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=self.max_epochs, eta_min=1e-7,
-            )
-            return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
-
-        # Normal training: cosine annealing with linear warmup (5% of training)
-        warmup_epochs = max(1, self.max_epochs // 20)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=self.max_epochs - warmup_epochs, eta_min=1e-7,
-        )
-        warmup = torch.optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=0.01, total_iters=warmup_epochs,
-        )
-        combined = torch.optim.lr_scheduler.SequentialLR(
-            optimizer, schedulers=[warmup, scheduler], milestones=[warmup_epochs],
-        )
-        return {"optimizer": optimizer, "lr_scheduler": {"scheduler": combined, "interval": "epoch"}}
+        return optimizer
 
 
-def _build_teacher(model_name):
-    """Create frozen BirdSet teacher model for distillation."""
-    from transformers import EfficientNetForImageClassification
 
-    teacher = EfficientNetForImageClassification.from_pretrained(
-        model_name,
-        num_channels=1,
-        ignore_mismatched_sizes=True,
-    )
-    teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad = False
-    return teacher
+def _load_pseudo_label_summary(pseudo_labels_csv):
+    """Load pseudo-label summary JSON (saved alongside CSV) for W&B config."""
+    if not pseudo_labels_csv:
+        return {}
+    import json
+    from pathlib import Path
+    summary_path = Path(pseudo_labels_csv).with_suffix(".json")
+    if not summary_path.is_file():
+        return {}
+    try:
+        with open(summary_path) as f:
+            s = json.load(f)
+        return {
+            "pseudo_threshold": s.get("threshold"),
+            "pseudo_segments_kept": s.get("segments_kept"),
+            "pseudo_yield_rate": s.get("yield_rate"),
+            "pseudo_unique_species": s.get("unique_species"),
+            "pseudo_mean_conf": s.get("confidence_distribution", {}).get("mean"),
+        }
+    except Exception:
+        return {}
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fine-tune BirdSet EfficientNet on BirdCLEF 2026")
-    parser.add_argument("--data_dir", type=str, default=os.path.join(PROJ_ROOT, "data"))
-    parser.add_argument(
-        "--backbone",
-        type=str,
-        default="birdset_b1",
-        help="Backbone identifier: birdset_b1 (default), birdset_b0, "
-             "efficientnet_b0, mobilenetv3_small, resnet18, convnext_tiny, "
-             "or 'hf:Org/Model' for arbitrary HF audio models.",
-    )
-    parser.add_argument(
-        "--birdset_model_name",
-        type=str,
-        default="DBD-research-group/EfficientNet-B1-BirdSet-XCL",
-        help="HF model id for BirdSet teacher when --distill is set "
-             "(separate from --backbone).",
-    )
-    parser.add_argument("--max_time_frames", type=int, default=768)
-    parser.add_argument("--chunk_hop_frames", type=int, default=512)
-    parser.add_argument("--save_top_k", type=int, default=1,
-                        help="Number of best ckpts to retain per run (disk-saver).")
-    parser.add_argument("--compile", action="store_true",
-                        help="torch.compile the model (20-40%% speedup if it works).")
-
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser = argparse.ArgumentParser(description="Fine-tune HTSAT on BirdCLEF 2026")
+    parser.add_argument("--data_dir", type=str,
+                        default=os.path.join(PROJ_ROOT, "data"))
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to AudioSet pretrained HTSAT checkpoint")
+    parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_epochs", type=int, default=50)
-    parser.add_argument("--precision", type=str, default="16",
-                        choices=["16", "bf16", "32", "16-mixed", "bf16-mixed"])
-    parser.add_argument("--lr", type=float, default=5e-5)
-    parser.add_argument("--save_dir", type=str, default=os.path.join(PROJ_ROOT, "checkpoints"))
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--warmup_epochs", type=int, default=1)
+    parser.add_argument("--val_frac", type=float, default=0.25)
+    parser.add_argument("--save_dir", type=str,
+                        default=os.path.join(PROJ_ROOT, "checkpoints"))
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--resume_from", type=str, default=None)
-    parser.add_argument("--warmstart", type=str, default=None,
-                        help="Load model weights (+ optimizer state) from a checkpoint "
-                             "without resuming epoch/scheduler. Used for pseudo-label retraining.")
-
-    parser.add_argument("--label_smoothing", type=float, default=0.05)
-    parser.add_argument("--loss", type=str, default="focal", choices=["bce", "focal"])
-    parser.add_argument("--focal_alpha", type=float, default=0.25)
-    parser.add_argument("--focal_gamma", type=float, default=2.0)
-
-    parser.add_argument("--use_wandb", action="store_true")
-    parser.add_argument("--wandb_project", type=str, default="birdclef-2026")
-    parser.add_argument("--run_name", type=str, default=None)
-    parser.add_argument("--run_id", type=str, default=None)
-
-    parser.add_argument("--n_folds", type=int, default=5)
-    parser.add_argument("--fold", type=int, default=0)
-
-    parser.add_argument("--multi_mix", action="store_true", default=True)
-    parser.add_argument("--no_multi_mix", action="store_false", dest="multi_mix")
-    parser.add_argument("--mix_prob", type=float, default=0.0)
-    parser.add_argument("--mixup_alpha", type=float, default=0.0)
-
-    parser.add_argument("--distill", dest="distill", action="store_true")
-    parser.add_argument("--no_distill", dest="distill", action="store_false")
-    parser.set_defaults(distill=False)
-    parser.add_argument("--distill_weight", type=float, default=0.15)
-    parser.add_argument("--distill_temperature", type=float, default=2.0)
-
-    parser.add_argument("--preload", action="store_true")
-    parser.add_argument("--valid_regions", type=str, default=None)
-    parser.add_argument("--pseudo_labels", type=str, default=None)
-    parser.add_argument("--pseudo_distill_weight", type=float, default=1.0,
-                        help="Weight for pseudo-label logit distillation loss (KL divergence)")
-    parser.add_argument("--pseudo_power_t", type=float, default=1.0,
-                        help="Power transform exponent T applied to pseudo-label sigmoid(logits) "
-                             "before training (T>1 sharpens, suppresses noise). 1.0 = no transform.")
-    parser.add_argument("--pseudo_mixup_alpha", type=float, default=0.0,
-                        help="Beta(α,α) for cross-domain MixUp between pseudo soundscape chunks "
-                             "and labeled focal samples. 0 = off. Babych'25 1st-place self-training.")
-    parser.add_argument("--balance_alpha", type=float, default=0.5)
-
-    parser.add_argument("--distill_manifest", type=str, default=None,
-                        help="Path to distill_manifest.csv for supplemental audio")
-    parser.add_argument("--hard_negatives", dest="hard_negatives", action="store_true",
-                        help="Include non-target species as extra training classes")
-    parser.add_argument("--no_hard_negatives", dest="hard_negatives", action="store_false")
-    parser.set_defaults(hard_negatives=True)
-
-    parser.add_argument("--bg_mix_prob", type=float, default=0.0,
-                        help="Probability of mixing soundscape background noise per sample")
-    parser.add_argument("--bg_snr_min", type=float, default=3.0,
-                        help="Minimum SNR (dB) for background mixing")
-    parser.add_argument("--bg_snr_max", type=float, default=15.0,
-                        help="Maximum SNR (dB) for background mixing")
-
-    parser.add_argument("--min_duration", type=float, default=3.0)
-    parser.add_argument("--max_duration", type=float, default=30.0)
-    parser.add_argument("--full_files", dest="full_files", action="store_true")
-    parser.add_argument("--no_full_files", dest="full_files", action="store_false")
-    parser.set_defaults(full_files=True)
-
+    parser.add_argument("--resume_from", type=str, default=None,
+                        help="Path to Lightning checkpoint to resume training from")
+    parser.add_argument("--label_smoothing", type=float, default=0.1,
+                        help="Label smoothing factor (0=hard labels, 0.1=recommended)")
+    parser.add_argument("--loss", type=str, default="bce", choices=["bce", "focal"],
+                        help="Loss function: 'bce' or 'focal'")
+    parser.add_argument("--focal_alpha", type=float, default=0.25,
+                        help="Focal loss alpha (positive class weight)")
+    parser.add_argument("--focal_gamma", type=float, default=2.0,
+                        help="Focal loss gamma (focusing parameter)")
+    parser.add_argument("--use_wandb", action="store_true",
+                        help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb_project", type=str, default="birdclef-2026",
+                        help="W&B project name")
+    parser.add_argument("--run_name", type=str, default=None,
+                        help="W&B run name (defaults to auto-generated)")
+    parser.add_argument("--run_id", type=str, default=None,
+                        help="Run ID for checkpoint subdir (defaults to seed<N>)")
+    parser.add_argument("--n_folds", type=int, default=5,
+                        help="Number of CV folds")
+    parser.add_argument("--fold", type=int, default=0,
+                        help="Which fold to hold out for validation (0 to n_folds-1)")
+    parser.add_argument("--multi_mix", action="store_true", default=True,
+                        help="Enable multi-species mixing augmentation on train_audio")
+    parser.add_argument("--no_multi_mix", action="store_false", dest="multi_mix",
+                        help="Disable multi-species mixing augmentation")
+    parser.add_argument("--mix_prob", type=float, default=0.7,
+                        help="Probability of multi-species mixing per sample")
+    parser.add_argument("--mixup_alpha", type=float, default=0.4,
+                        help="Beta distribution alpha for SuMix (0=disabled)")
+    parser.add_argument("--preload", action="store_true",
+                        help="Preload all train_audio waveforms into RAM (~34GB) for faster mixing")
+    parser.add_argument("--valid_regions", type=str, default=None,
+                        help="Path to valid_regions.json from preprocess_activity.py")
+    parser.add_argument("--pseudo_labels", type=str, default=None,
+                        help="Path to pseudo_labels.csv from pseudo_label.py")
+    parser.add_argument("--balance_alpha", type=float, default=0.5,
+                        help="Class-balance strength: 0=uniform, 0.5=sqrt(inv-freq), 1=full inv-freq")
     args = parser.parse_args()
 
-    if args.precision == "16-mixed":
-        args.precision = "16"
-    elif args.precision == "bf16-mixed":
-        args.precision = "bf16"
-
     pl.seed_everything(args.seed)
+
+    # Use tensor cores for fp32 matmuls (L40S has them)
     torch.set_float32_matmul_precision("medium")
 
-    label_map = build_label_map(os.path.join(args.data_dir, "taxonomy.csv"))
-    num_classes = len(label_map)
+    # Patch config for our dataset
+    htsat_config.classes_num = len(
+        build_label_map(os.path.join(args.data_dir, "taxonomy.csv"))
+    )
+    htsat_config.loss_type = "clip_bce"
+    htsat_config.enable_tscam = True
 
-    logger.info("=== BirdCLEF training ===")
-    logger.info(f"Backbone: {args.backbone}")
-    if args.distill:
-        logger.info(f"BirdSet teacher (distill): {args.birdset_model_name}")
-    logger.info(f"Variable-length input: {args.min_duration}s - {args.max_duration}s")
-    if args.full_files:
-        logger.info("Full-file mode enabled for train_audio (no cropping)")
+    logger.info(f"=== Full model training ===")
 
-    (train_loader, val_loader, label_map, num_classes,
-     n_train_audio, num_train_classes) = get_dataloaders(
+    # Build dataloaders
+    train_loader, val_loader, label_map, num_classes, n_train_audio = get_dataloaders(
         args.data_dir,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        sample_rate=32000,
-        min_duration=args.min_duration,
-        max_duration=args.max_duration,
+        sample_rate=htsat_config.sample_rate,
+        clip_duration=htsat_config.clip_samples / htsat_config.sample_rate,
+        val_frac=args.val_frac,
         seed=args.seed,
         label_smoothing=args.label_smoothing,
         n_folds=args.n_folds,
@@ -555,94 +412,47 @@ def main():
         preload=args.preload,
         valid_regions_path=args.valid_regions,
         pseudo_labels_csv=args.pseudo_labels,
-        pseudo_power_t=args.pseudo_power_t,
         balance_alpha=args.balance_alpha,
-        full_files=args.full_files,
-        distill_manifest=args.distill_manifest,
-        hard_negatives=args.hard_negatives,
-        bg_mix_prob=args.bg_mix_prob,
-        bg_snr_range=(args.bg_snr_min, args.bg_snr_max),
     )
+    logger.info(f"Classes: {num_classes}, Train batches: {len(train_loader)}, "
+                f"Val batches: {len(val_loader)}")
 
-    logger.info(f"Target classes: {num_classes}, Train classes: {num_train_classes}, "
-                f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
-
-    model = BirdCLEFModel(
-        num_classes=num_classes,
-        num_train_classes=num_train_classes,
-        sample_rate=32000,
-        backbone_name=args.backbone,
-        max_time_frames=args.max_time_frames,
-        chunk_hop_frames=args.chunk_hop_frames,
-        pretrained=True,
-    )
-    logger.info(f"Model params: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M"
-                f" (head outputs {num_train_classes} classes)")
-
-    if args.compile:
-        try:
-            model = torch.compile(model)
-            logger.info("torch.compile enabled")
-        except Exception as exc:
-            logger.warning(f"torch.compile failed ({exc}); continuing without")
-
-    teacher = _build_teacher(args.birdset_model_name) if args.distill else None
-
+    # Build model
+    htsat_config.classes_num = num_classes
+    model = load_pretrained_htsat(args.checkpoint, htsat_config, num_classes)
     idx_to_label = {v: k for k, v in label_map.items()}
     wrapper = BirdCLEFWrapper(
-        model=model,
-        num_classes=num_classes,
+        model, htsat_config, num_classes,
         learning_rate=args.lr,
+        warmup_epochs=args.warmup_epochs,
         max_epochs=args.max_epochs,
         loss_type=args.loss,
         focal_alpha=args.focal_alpha,
         focal_gamma=args.focal_gamma,
         mixup_alpha=args.mixup_alpha,
-        distill_weight=args.distill_weight,
-        distill_temperature=args.distill_temperature,
-        teacher_model=teacher,
         idx_to_label=idx_to_label,
-        pseudo_distill_weight=args.pseudo_distill_weight,
-        pseudo_mixup_alpha=args.pseudo_mixup_alpha,
     )
 
-    # --- Warm-start: load model weights from a prior checkpoint ---
-    if args.warmstart:
-        logger.info(f"Warm-starting from: {args.warmstart}")
-        ckpt = torch.load(args.warmstart, map_location="cpu", weights_only=False)
-        state_dict = ckpt.get("state_dict", ckpt)
-
-        # Load model weights (handles Lightning "model." prefix)
-        missing, unexpected = wrapper.load_state_dict(state_dict, strict=False)
-        unexpected_model = [k for k in unexpected if not k.startswith("lr_schedulers")
-                           and not k.startswith("optimizer_states")]
-        if missing:
-            logger.warning(f"  Warm-start missing keys: {missing}")
-        if unexpected_model:
-            logger.warning(f"  Warm-start unexpected keys: {unexpected_model}")
-        logger.info(f"  Model weights loaded successfully")
-
-        # Flag for configure_optimizers to use warm-start LR schedule
-        wrapper._warmstart = True
-
+    # Save checkpoints in a run-specific subdirectory
     run_id = args.run_id or f"seed{args.seed}"
     run_save_dir = os.path.join(args.save_dir, run_id)
     os.makedirs(run_save_dir, exist_ok=True)
     logger.info(f"Checkpoints will be saved to: {run_save_dir}")
 
+    # Callbacks
     ckpt_callback = ModelCheckpoint(
         dirpath=run_save_dir,
-        filename="birdclef-birdset-{epoch:02d}-{val_macro_auc:.4f}",
+        filename="birdclef-htsat-{epoch:02d}-{val_macro_auc:.4f}",
         monitor="val_macro_auc",
         mode="max",
-        save_top_k=args.save_top_k,
+        save_top_k=5,
     )
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
 
+    # Logger
     loggers = []
     if args.use_wandb:
         from pytorch_lightning.loggers import WandbLogger
-
         wandb_logger = WandbLogger(
             project=args.wandb_project,
             name=args.run_name,
@@ -651,37 +461,22 @@ def main():
                 "batch_size": args.batch_size,
                 "max_epochs": args.max_epochs,
                 "seed": args.seed,
+                "val_frac": args.val_frac,
+                "warmup_epochs": args.warmup_epochs,
+                "label_smoothing": args.label_smoothing,
                 "fold": args.fold,
                 "n_folds": args.n_folds,
-                "backbone": args.backbone,
-                "birdset_model_name": args.birdset_model_name,
-                "max_time_frames": args.max_time_frames,
-                "chunk_hop_frames": args.chunk_hop_frames,
+                "model": "htsat-tiny",
                 "loss": args.loss,
                 "focal_alpha": args.focal_alpha,
                 "focal_gamma": args.focal_gamma,
                 "multi_mix": args.multi_mix,
                 "mix_prob": args.mix_prob,
                 "mixup_alpha": args.mixup_alpha,
-                "distill": args.distill,
-                "distill_weight": args.distill_weight,
-                "distill_temperature": args.distill_temperature,
                 "pseudo_labels": args.pseudo_labels,
-                "pseudo_distill_weight": args.pseudo_distill_weight,
-                "pseudo_power_t": args.pseudo_power_t,
-                "pseudo_mixup_alpha": args.pseudo_mixup_alpha,
-                "warmstart": args.warmstart,
                 "balance_alpha": args.balance_alpha,
-                "min_duration": args.min_duration,
-                "max_duration": args.max_duration,
-                "full_files": args.full_files,
                 "n_train_audio": n_train_audio,
-                "distill_manifest": args.distill_manifest,
-                "hard_negatives": args.hard_negatives,
-                "num_train_classes": num_train_classes,
-                "bg_mix_prob": args.bg_mix_prob,
-                "bg_snr_min": args.bg_snr_min,
-                "bg_snr_max": args.bg_snr_max,
+                **_load_pseudo_label_summary(args.pseudo_labels),
             },
         )
         loggers.append(wandb_logger)
@@ -694,10 +489,9 @@ def main():
         logger=loggers if loggers else True,
         default_root_dir=args.save_dir,
         log_every_n_steps=50,
-        precision=args.precision,
-        gradient_clip_val=1.0,
+        precision=32,
         enable_progress_bar=False,
-        num_sanity_val_steps=0,
+        num_sanity_val_steps=0,  # skip partial sanity check (misleading AUC on subset)
     )
 
     trainer.fit(wrapper, train_loader, val_loader, ckpt_path=args.resume_from)
